@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
 // support Websocket and tcp.
+#[allow(clippy::large_enum_variant)]
 pub enum Stream {
-    WebSocket(Box<websocket::WsFramedStream>),
-    Tcp(Box<tcp::FramedStream>),
+    WebSocket(websocket::WsFramedStream),
+    Tcp(tcp::FramedStream),
 }
 
 impl Stream {
@@ -80,7 +81,7 @@ impl Stream {
         let ws_stream =
             websocket::WsFramedStream::new(url, local_addr, proxy_conf, timeout_ms).await?;
         log::debug!("WebSocket connection established");
-        Ok(Self::WebSocket(Box::new(ws_stream)))
+        Ok(Self::WebSocket(ws_stream))
     }
 
     /// send message
@@ -111,6 +112,6 @@ impl Stream {
 
     #[inline]
     pub fn from(stream: TcpStream, stream_addr: SocketAddr) -> Self {
-        Self::Tcp(Box::new(tcp::FramedStream::from(stream, stream_addr)))
+        Self::Tcp(tcp::FramedStream::from(stream, stream_addr))
     }
 }
