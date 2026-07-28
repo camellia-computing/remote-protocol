@@ -1,0 +1,6 @@
+Camellia Remote Protocol
+Copyright (c) Camellia Computing and contributors.
+
+This repository is derived from the hbb_common component used by RustDesk. The normalized source
+baseline is recorded in SOURCE_PROVENANCE.json. Copyright notices and authorship in the source and
+upstream history remain applicable. The code is distributed under GNU AGPL version 3 only.
