@@ -4070,6 +4070,7 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_uinput_ipc_path_is_shared_across_uids() {
+        let _guard = lock_config_state_for_test();
         const ROOT_UID: u32 = 0;
         const USER_UID: u32 = 1000;
 
