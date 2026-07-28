@@ -15,8 +15,12 @@ may set `CAMELLIA_REMOTE_UPDATE_URL` at build time to a version service that imp
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 ```
+
+`Cargo.lock` is committed because both Remote runtimes consume this repository
+as a pinned source contract. CI must validate the exact reviewed registry and
+Git dependency graph rather than silently resolving a newer graph.
 
 See `SOURCE_PROVENANCE.json`, `NOTICE`, and `LICENSE` for origin and licensing information.
