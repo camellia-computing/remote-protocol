@@ -4,15 +4,40 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: remote-protocol-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never
+
+  automation:
+    name: Automation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
   quality:
     name: Quality
     runs-on: ubuntu-24.04
@@ -33,6 +58,44 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
+
+  required:
+    name: CI / Required
+    if: always()
+    needs:
+      - dependency-review
+      - automation
+      - quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce required results
+        shell: bash
+        env:
+          AUTOMATION_RESULT: ${{ needs.automation.result }}
+          DEPENDENCY_REVIEW_RESULT: ${{ needs.dependency-review.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: |
+          [[ "$AUTOMATION_RESULT" == success ]] || {
+            echo "Automation must succeed, got: $AUTOMATION_RESULT" >&2
+            exit 1
+          }
+          [[ "$QUALITY_RESULT" == success ]] || {
+            echo "Quality must succeed, got: $QUALITY_RESULT" >&2
+            exit 1
+          }
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            [[ "$DEPENDENCY_REVIEW_RESULT" == success ]] || {
+              echo "Dependency review must succeed, got: $DEPENDENCY_REVIEW_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$DEPENDENCY_REVIEW_RESULT" == skipped ]] || {
+              echo "Dependency review must be skipped outside pull requests, got: $DEPENDENCY_REVIEW_RESULT" >&2
+              exit 1
+            }
+          fi
