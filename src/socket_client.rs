@@ -276,8 +276,8 @@ mod tests {
             "1.1.1.1.nip.io:8080"
         );
         assert_eq!(
-            ipv4_to_ipv6("camellia.aimmv.com".to_owned(), false),
-            "camellia.aimmv.com"
+            ipv4_to_ipv6("remote.example.com".to_owned(), false),
+            "remote.example.com"
         );
     }
 

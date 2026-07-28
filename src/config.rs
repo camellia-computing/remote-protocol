@@ -97,11 +97,11 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
-pub const LINK_DOCS_HOME: &str = "https://camellia.aimmv.com/docs/en/";
+pub const LINK_DOCS_HOME: &str = "https://github.com/camellia-computing/remote-client";
 pub const LINK_DOCS_X11_REQUIRED: &str =
-    "https://camellia.aimmv.com/docs/en/manual/linux/#x11-required";
+    "https://github.com/camellia-computing/remote-client/issues";
 pub const LINK_HEADLESS_LINUX_SUPPORT: &str =
-    "https://github.com/CamelliaCorp/camellia/wiki/Headless-Linux-Support";
+    "https://github.com/camellia-computing/remote-client/issues";
 
 lazy_static::lazy_static! {
     pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([

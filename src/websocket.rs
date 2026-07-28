@@ -378,22 +378,22 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:21116"), "ws://127.0.0.1:21118");
         assert_eq!(check_ws("127.0.0.1:21117"), "ws://127.0.0.1:21119");
         assert_eq!(
-            check_ws("camellia.aimmv.com:21115"),
-            "ws://camellia.aimmv.com/ws/id"
+            check_ws("remote.example.com:21115"),
+            "ws://remote.example.com/ws/id"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:21116"),
-            "ws://camellia.aimmv.com/ws/id"
+            check_ws("remote.example.com:21116"),
+            "ws://remote.example.com/ws/id"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:21117"),
-            "ws://camellia.aimmv.com/ws/relay"
+            check_ws("remote.example.com:21117"),
+            "ws://remote.example.com/ws/relay"
         );
         // set relay-server without port
         Config::set_option("relay-server".to_string(), "127.0.0.1".to_string());
         Config::set_option(
             "api-server".to_string(),
-            "https://api.camellia.aimmv.com".to_string(),
+            "https://api.example.com".to_string(),
         );
         assert_eq!(
             check_ws("[0:0:0:0:0:0:0:1]:21115"),
@@ -408,16 +408,16 @@ mod tests {
             "ws://[0:0:0:0:0:0:0:1]:21119"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:21115"),
-            "wss://camellia.aimmv.com/ws/id"
+            check_ws("remote.example.com:21115"),
+            "wss://remote.example.com/ws/id"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:21116"),
-            "wss://camellia.aimmv.com/ws/id"
+            check_ws("remote.example.com:21116"),
+            "wss://remote.example.com/ws/id"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:21117"),
-            "wss://camellia.aimmv.com/ws/relay"
+            check_ws("remote.example.com:21117"),
+            "wss://remote.example.com/ws/relay"
         );
         // set relay-server with default port
         Config::set_option("relay-server".to_string(), "127.0.0.1:21117".to_string());
@@ -427,16 +427,16 @@ mod tests {
         // set relay-server with custom port
         Config::set_option("relay-server".to_string(), "127.0.0.1:34567".to_string());
         assert_eq!(
-            check_ws("camellia.aimmv.com:21115"),
-            "wss://camellia.aimmv.com/ws/id"
+            check_ws("remote.example.com:21115"),
+            "wss://remote.example.com/ws/id"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:21116"),
-            "wss://camellia.aimmv.com/ws/id"
+            check_ws("remote.example.com:21116"),
+            "wss://remote.example.com/ws/id"
         );
         assert_eq!(
-            check_ws("camellia.aimmv.com:34567"),
-            "wss://camellia.aimmv.com/ws/relay"
+            check_ws("remote.example.com:34567"),
+            "wss://remote.example.com/ws/relay"
         );
 
         // set custom-rendezvous-server without port

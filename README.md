@@ -7,6 +7,10 @@ The repository is versioned independently and consumed at an exact Git commit. E
 wire constants and protobuf fields are retained where they are required for client/server protocol
 operation; they are not product branding or a compatibility promise for pre-release local data.
 
+No Camellia-operated network endpoint is compiled into the default build. A reviewed client release
+may set `CAMELLIA_REMOTE_UPDATE_URL` at build time to a version service that implements the bounded
+`VersionCheckRequest`/`VersionCheckResponse` contract. When it is unset, update checks remain offline.
+
 ## Development
 
 ```bash

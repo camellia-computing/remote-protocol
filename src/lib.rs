@@ -499,10 +499,16 @@ pub struct VersionCheckResponse {
     pub url: String,
 }
 
-pub const VER_TYPE_RUSTDESK_CLIENT: &str = "rustdesk-client";
+pub const VER_TYPE_CAMELLIA_REMOTE_CLIENT: &str = "camellia-remote-client";
 
 pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
-    const URL: &str = "https://api.camellia.aimmv.com/version/latest";
+    // No vendor endpoint is compiled into development builds. A release that
+    // enables update checks must provide its reviewed HTTPS endpoint at build
+    // time; an empty value keeps the client entirely offline for this feature.
+    const URL: &str = match option_env!("CAMELLIA_REMOTE_UPDATE_URL") {
+        Some(value) => value,
+        None => "",
+    };
 
     use sysinfo::System;
     let system = System::new();
