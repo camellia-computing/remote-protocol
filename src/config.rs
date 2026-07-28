@@ -3858,6 +3858,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_settings() {
+        let _guard = lock_config_state_for_test();
         DEFAULT_SETTINGS
             .write()
             .unwrap()
