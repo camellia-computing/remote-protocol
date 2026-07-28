@@ -476,16 +476,12 @@ pub fn get_home_dir_trusted() -> Option<PathBuf> {
             if Path::is_dir(home) {
                 Some(PathBuf::from(home))
             } else {
-                log::warn!(
-                    "Home directory for uid {} does not exist or is not a directory: {:?}",
-                    uid,
-                    home
-                );
+                log::warn!("Trusted home directory is missing or is not a directory");
                 None
             }
         }
         None => {
-            log::warn!("Failed to get user info for uid {}", uid);
+            log::warn!("Current user lookup failed");
             None
         }
     }
@@ -522,8 +518,11 @@ mod tests {
 
         // Verify: returns valid path that is NOT the fake HOME
         if let Some(path) = result {
-            assert!(path.is_absolute(), "Path should be absolute: {:?}", path);
-            assert!(path.is_dir(), "Path should be a directory: {:?}", path);
+            assert!(path.is_absolute(), "Trusted home path should be absolute");
+            assert!(
+                path.is_dir(),
+                "Trusted home path should identify a directory"
+            );
             assert_ne!(
                 path.to_string_lossy(),
                 "/tmp/fake_malicious_home",

@@ -4081,8 +4081,7 @@ mod tests {
         let app_name = APP_NAME.read().unwrap().clone();
         assert!(
             path_root.starts_with(&format!("/tmp/{app_name}-service/")),
-            "unexpected uinput ipc path: {}",
-            path_root
+            "uinput service IPC path must use the shared service namespace"
         );
 
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");

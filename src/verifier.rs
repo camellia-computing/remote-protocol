@@ -123,7 +123,7 @@ fn webpki_server_verifier(
     let rustls_native_certs::CertificateResult { certs, errors, .. } =
         rustls_native_certs::load_native_certs();
     if !errors.is_empty() {
-        log::warn!("native root CA certificate loading errors: {errors:?}");
+        log::warn!("Some native root CA certificates could not be loaded");
     }
     root_cert_store.add_parsable_certificates(certs);
 

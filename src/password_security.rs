@@ -277,9 +277,6 @@ mod test {
         let data = "1ü1111";
         let encrypted = encrypt_str_or_original(data, version, max_len);
         let (decrypted, succ, store) = decrypt_str_or_original(&encrypted, version);
-        println!("data: {data}");
-        println!("encrypted: {encrypted}");
-        println!("decrypted: {decrypted}");
         assert_eq!(data, decrypted);
         assert_eq!(version, &encrypted[..2]);
         assert!(succ);
@@ -296,9 +293,6 @@ mod test {
         let data: Vec<u8> = "1ü1111".as_bytes().to_vec();
         let encrypted = encrypt_vec_or_original(&data, version, max_len);
         let (decrypted, succ, store) = decrypt_vec_or_original(&encrypted, version);
-        println!("data: {data:?}");
-        println!("encrypted: {encrypted:?}");
-        println!("decrypted: {decrypted:?}");
         assert_eq!(data, decrypted);
         assert_eq!(version.as_bytes(), &encrypted[..2]);
         assert!(!store);
