@@ -21,6 +21,8 @@ cargo test --locked --all-targets --all-features
 
 `Cargo.lock` is committed because both Remote runtimes consume this repository
 as a pinned source contract. CI must validate the exact reviewed registry and
-Git dependency graph rather than silently resolving a newer graph.
+Git dependency graph rather than silently resolving a newer graph. The required
+CI gate also compiles Apple-specific code on a hosted macOS runner so conditional
+platform implementations cannot bypass review.
 
 See `SOURCE_PROVENANCE.json`, `NOTICE`, and `LICENSE` for origin and licensing information.
