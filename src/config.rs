@@ -1685,13 +1685,12 @@ impl Config {
         return CONFIG.read().unwrap().clone();
     }
 
-    // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
-    // This matches historical behavior, but may need revisiting in a separate PR.
     pub fn set(cfg: Config) -> bool {
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
             return false;
         }
+        let permanent_credentials_changed = lock.password != cfg.password || lock.salt != cfg.salt;
         *lock = cfg;
         lock.store();
         // Drop CONFIG lock before acquiring KEY_PAIR lock to avoid potential deadlock.
@@ -1700,6 +1699,9 @@ impl Config {
         drop(lock);
         #[cfg(target_os = "macos")]
         Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
+        if permanent_credentials_changed {
+            Self::clear_trusted_devices();
+        }
         true
     }
 
@@ -3326,7 +3328,9 @@ mod tests {
 
     struct ConfigStateTestGuard {
         original_config: Config,
+        original_config2: Config2,
         original_hard_settings: HashMap<String, String>,
+        original_trusted_devices: (Vec<TrustedDevice>, bool),
     }
 
     struct ConfigPathTestGuard {
@@ -3339,12 +3343,18 @@ mod tests {
     impl ConfigStateTestGuard {
         fn new(config: Config, hard_settings: HashMap<String, String>) -> Self {
             let original_config = Config::get();
+            let original_config2 = CONFIG2.read().unwrap().clone();
             let original_hard_settings = HARD_SETTINGS.read().unwrap().clone();
+            let original_trusted_devices = TRUSTED_DEVICES.read().unwrap().clone();
             *CONFIG.write().unwrap() = config;
+            *CONFIG2.write().unwrap() = Config2::default();
             *HARD_SETTINGS.write().unwrap() = hard_settings;
+            *TRUSTED_DEVICES.write().unwrap() = Default::default();
             Self {
                 original_config,
+                original_config2,
                 original_hard_settings,
+                original_trusted_devices,
             }
         }
     }
@@ -3352,7 +3362,9 @@ mod tests {
     impl Drop for ConfigStateTestGuard {
         fn drop(&mut self) {
             *CONFIG.write().unwrap() = self.original_config.clone();
+            *CONFIG2.write().unwrap() = self.original_config2.clone();
             *HARD_SETTINGS.write().unwrap() = self.original_hard_settings.clone();
+            *TRUSTED_DEVICES.write().unwrap() = self.original_trusted_devices.clone();
         }
     }
 
@@ -3667,6 +3679,39 @@ mod tests {
             assert!(!updated.password.starts_with(PASSWORD_ENC_VERSION));
             assert_eq!(updated.password, "legacy-secret");
             assert!(updated.salt.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_set_invalidates_trusted_devices_only_when_permanent_credentials_change() {
+        let suffix = std::process::id();
+        let mut config = Config {
+            password: format!("stored-password-{suffix}"),
+            salt: format!("password-salt-{suffix}"),
+            ..Default::default()
+        };
+        with_config_and_hard_settings(config.clone(), HashMap::new(), || {
+            let trusted_device = TrustedDevice {
+                hwid: Bytes::from(vec![1, 2, 3, 4]),
+                time: crate::get_time(),
+                id: "trusted-device".to_owned(),
+                name: "Test device".to_owned(),
+                platform: "test".to_owned(),
+            };
+            Config::set_trusted_devices(vec![trusted_device.clone()]);
+
+            config.key_confirmed = true;
+            assert!(Config::set(config.clone()));
+            assert_eq!(Config::get_trusted_devices().len(), 1);
+
+            config.password = format!("replacement-password-{suffix}");
+            assert!(Config::set(config.clone()));
+            assert!(Config::get_trusted_devices().is_empty());
+
+            Config::set_trusted_devices(vec![trusted_device]);
+            config.salt = format!("replacement-salt-{suffix}");
+            assert!(Config::set(config));
+            assert!(Config::get_trusted_devices().is_empty());
         });
     }
 
