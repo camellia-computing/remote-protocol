@@ -1,10 +1,7 @@
 use sha2::{Digest, Sha256};
 use sodiumoxide::base64;
 
-use crate::{
-    log,
-    password_security::{decrypt_str_or_original, symmetric_crypt},
-};
+use crate::password_security::symmetric_crypt;
 
 pub(super) const PASSWORD_ENC_VERSION: &str = "00";
 pub(super) const PERMANENT_PASSWORD_ENC_VERSION: &str = "01";
@@ -97,28 +94,7 @@ pub(super) fn decrypt_permanent_password_str_or_original(storage: &str) -> (Stri
 }
 
 pub fn local_permanent_password_storage_is_usable_for_auth(storage: &str, salt: &str) -> bool {
-    if storage.is_empty() {
-        return false;
-    }
-
-    if decode_permanent_password_h1_from_storage(storage).is_some() {
-        return !salt.is_empty();
-    }
-    if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
-        let (_, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
-        if decrypted {
-            log::error!("Permanent password storage looks current but cannot be decoded as a hash");
-            return false;
-        }
-    }
-
-    let (_, decrypted, looks_like_plaintext) =
-        decrypt_str_or_original(storage, PASSWORD_ENC_VERSION);
-    if storage.starts_with(PASSWORD_ENC_VERSION) && !decrypted && !looks_like_plaintext {
-        log::error!("Permanent password storage looks encrypted but cannot be decrypted");
-        return false;
-    }
-    true
+    !salt.is_empty() && decode_permanent_password_h1_from_storage(storage).is_some()
 }
 
 pub fn preset_permanent_password_storage_is_usable_for_auth(storage: &str, salt: &str) -> bool {
@@ -146,14 +122,10 @@ fn local_permanent_password_storage_matches_plain(storage: &str, salt: &str, inp
         return false;
     }
     if let Some(stored_h1) = decode_permanent_password_h1_from_storage(storage) {
-        if salt.is_empty() {
-            log::error!("Salt is empty but permanent password storage is hashed");
-            return false;
-        }
         let h1 = compute_permanent_password_h1(input, salt);
         return constant_time_eq_32(&h1, &stored_h1);
     }
-    storage == input
+    false
 }
 
 pub(super) fn preset_permanent_password_storage_matches_plain(
@@ -187,27 +159,9 @@ pub fn decode_permanent_password_h1_from_storage(
     None
 }
 
-// Salt can be updated only when the password is empty, plaintext, or decryptable
-// legacy storage. Current-prefixed storage is treated as salt-bound.
-pub(super) fn password_is_empty_or_not_hashed(permanent_password_storage: &str) -> bool {
-    if permanent_password_storage.is_empty() {
-        return true;
-    }
-    if decode_permanent_password_h1_from_storage(permanent_password_storage).is_some() {
-        return false;
-    }
-    if permanent_password_storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
-        return false;
-    }
-    let (_, decrypted, looks_like_plaintext) =
-        decrypt_str_or_original(permanent_password_storage, PASSWORD_ENC_VERSION);
-    decrypted || looks_like_plaintext
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::password_security::encrypt_str_or_original;
 
     fn encode_hbbs_preset_password_storage_from_h1(h1: &[u8; PERMANENT_PASSWORD_H1_LEN]) -> String {
         HBBS_PRESET_PASSWORD_HASH_PREFIX.to_owned() + &base64::encode(h1, base64::Variant::Original)
@@ -329,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_plain_preset_password_without_salt_keeps_old_behavior() {
+    fn test_plaintext_preset_without_salt_is_compared_literally() {
         let storage = "01not-a-valid-hash";
 
         assert!(preset_permanent_password_storage_is_usable_for_auth(
@@ -375,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_plain_preset_password_that_decodes_as_hash_requires_salt() {
+    fn test_unencrypted_hash_shaped_local_storage_is_rejected() {
         let h1 = compute_permanent_password_h1("plain-looking-hash", "salt123");
         let storage = encode_permanent_password_storage_from_h1(&h1);
 
@@ -385,28 +339,5 @@ mod tests {
         assert!(!local_permanent_password_storage_matches_plain(
             &storage, "", &storage
         ));
-    }
-
-    #[test]
-    fn test_password_is_empty_or_not_hashed_accepts_plaintext_and_decryptable_legacy_plaintext() {
-        let storage =
-            encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-
-        assert!(password_is_empty_or_not_hashed("00secret"));
-        assert!(password_is_empty_or_not_hashed(&storage));
-    }
-
-    #[test]
-    fn test_password_is_empty_or_not_hashed_treats_locked_00_storage_as_hashed() {
-        let invalid_payload = vec![42u8; sodiumoxide::crypto::secretbox::MACBYTES + 1];
-        let locked_storage = PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
-
-        assert!(!password_is_empty_or_not_hashed(&locked_storage));
-    }
-
-    #[test]
-    fn test_password_is_empty_or_not_hashed_treats_invalid_01_storage_as_hashed() {
-        assert!(!password_is_empty_or_not_hashed("01not-a-valid-hash"));
     }
 }
