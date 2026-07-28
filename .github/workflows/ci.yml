@@ -62,12 +62,27 @@ jobs:
       - name: Test
         run: cargo test --locked --all-targets --all-features
 
+  macos-quality:
+    name: macOS quality
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: Check Apple-specific code
+        run: cargo check --locked --all-targets --all-features
+
   required:
     name: CI / Required
     if: always()
     needs:
       - dependency-review
       - automation
+      - macos-quality
       - quality
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -78,6 +93,7 @@ jobs:
           AUTOMATION_RESULT: ${{ needs.automation.result }}
           DEPENDENCY_REVIEW_RESULT: ${{ needs.dependency-review.result }}
           EVENT_NAME: ${{ github.event_name }}
+          MACOS_QUALITY_RESULT: ${{ needs.macos-quality.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
         run: |
           [[ "$AUTOMATION_RESULT" == success ]] || {
@@ -86,6 +102,10 @@ jobs:
           }
           [[ "$QUALITY_RESULT" == success ]] || {
             echo "Quality must succeed, got: $QUALITY_RESULT" >&2
+            exit 1
+          }
+          [[ "$MACOS_QUALITY_RESULT" == success ]] || {
+            echo "macOS quality must succeed, got: $MACOS_QUALITY_RESULT" >&2
             exit 1
           }
           if [[ "$EVENT_NAME" == pull_request ]]; then

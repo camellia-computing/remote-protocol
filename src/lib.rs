@@ -316,7 +316,7 @@ pub fn get_exe_time() -> SystemTime {
     })
 }
 
-/// Known cases where machine_uid::machine_id::get_machine_id() may fail:
+/// Known cases where machine_uid::get() may fail:
 /// - Windows shutdown: "The media is write protected. (os error 19)"
 /// - macOS (hard to reproduce, reproduced at login screen): "No matching IOPlatformUUID in `ioreg -rd1 -c IOPlatformExpertDevice` command"
 pub fn get_uuid() -> Vec<u8> {
@@ -341,7 +341,7 @@ pub fn get_uuid() -> Vec<u8> {
                 let username = whoami::username().trim_end_matches('\0').to_owned();
                 let max_retries = if username == "root" { 16 } else { 8 };
                 for i in 0..max_retries {
-                    match machine_uid::machine_id::get_machine_id() {
+                    match machine_uid::get() {
                         Ok(id) => {
                             let _ = CACHED_MACHINE_UID.set(id.into_bytes());
                             return;
@@ -359,7 +359,7 @@ pub fn get_uuid() -> Vec<u8> {
             return uid.clone();
         }
 
-        match machine_uid::machine_id::get_machine_id() {
+        match machine_uid::get() {
             Ok(id) => {
                 let uid = id.into_bytes();
                 let _ = CACHED_MACHINE_UID.set(uid.clone());
