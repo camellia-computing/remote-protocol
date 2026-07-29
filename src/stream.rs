@@ -1,5 +1,5 @@
+use crate::crypto::secretbox::Key;
 use crate::{config, tcp, websocket, ResultType};
-use sodiumoxide::crypto::secretbox::Key;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 

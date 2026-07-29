@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod crypto;
 pub mod platform;
 pub mod protos;
 pub use bytes;
@@ -34,7 +35,6 @@ pub use lazy_static;
 pub use mac_address;
 pub use rand;
 pub use regex;
-pub use sodiumoxide;
 pub use tokio_socks;
 pub use tokio_socks::IntoTargetAddr;
 pub use tokio_socks::TargetAddr;

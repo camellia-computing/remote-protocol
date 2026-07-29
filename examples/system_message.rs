@@ -16,5 +16,5 @@ fn main() {
         ["Ok".to_owned()].to_vec(),
     );
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    println!("result {:?}", &res);
+    println!("result {:?}", res);
 }

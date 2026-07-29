@@ -780,8 +780,8 @@ impl TransferJob {
                         }
                         let file_path = get_string(&path);
                         (
-                            format!("{}.download", &file_path),
-                            Some(format!("{}.digest", &file_path)),
+                            format!("{}.download", file_path),
+                            Some(format!("{}.digest", file_path)),
                         )
                     };
                     if let Some(dp) = digest_path.as_ref() {
@@ -1103,8 +1103,8 @@ impl TransferJob {
                 return;
             };
             let file_path = get_string(&path);
-            let download_path = format!("{}.download", &file_path);
-            let digest_path = format!("{}.digest", &file_path);
+            let download_path = format!("{}.download", file_path);
+            let digest_path = format!("{}.digest", file_path);
 
             let mut f = if Path::new(&download_path).exists() && Path::new(&digest_path).exists() {
                 // If both download and digest files exist, seek (writer) to the offset

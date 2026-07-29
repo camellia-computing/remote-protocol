@@ -2,9 +2,9 @@ use crate::{
     config::{
         keys::OPTION_RELAY_SERVER, use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
     },
+    crypto::secretbox::Key,
     protobuf::Message,
     socket_client::split_host_port,
-    sodiumoxide::crypto::secretbox::Key,
     tcp::Encrypt,
     tls::{get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,

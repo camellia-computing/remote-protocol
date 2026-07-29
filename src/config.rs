@@ -10,14 +10,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
 use rand::Rng;
 use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
-use sodiumoxide::base64;
-use sodiumoxide::crypto::sign;
 
 mod permanent_password;
 
@@ -33,6 +32,7 @@ use permanent_password::{
 
 use crate::{
     compress::{compress, decompress},
+    crypto::sign,
     log,
     password_security::{
         decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
@@ -1761,7 +1761,7 @@ impl PeerConfig {
         let path: PathBuf;
         if let Ok(forbidden_paths) = forbidden_paths {
             let id_encoded = if forbidden_paths.is_match(id) {
-                "base64_".to_string() + base64::encode(id, base64::Variant::Original).as_str()
+                "base64_".to_string() + BASE64.encode(id).as_str()
             } else {
                 id.to_string()
             };
@@ -1807,8 +1807,7 @@ impl PeerConfig {
                         .to_owned();
 
                     let id_decoded_string = if id.starts_with("base64_") && id.len() != 7 {
-                        let id_decoded =
-                            base64::decode(&id[7..], base64::Variant::Original).unwrap_or_default();
+                        let id_decoded = BASE64.decode(&id[7..]).unwrap_or_default();
                         String::from_utf8_lossy(&id_decoded).as_ref().to_owned()
                     } else {
                         id
@@ -1826,7 +1825,7 @@ impl PeerConfig {
                     (id, t, p)
                 })
                 .collect::<Vec<_>>();
-            vec_id_modified_time_path.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            vec_id_modified_time_path.sort_unstable_by_key(|item| std::cmp::Reverse(item.1));
             vec_id_modified_time_path
         } else {
             vec![]
@@ -3402,7 +3401,7 @@ mod tests {
     fn test_hbbs_00_hashed_preset_password_storage_matches_plain_with_salt() {
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
-        let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
+        let storage = "00".to_owned() + &BASE64.encode(h1);
         let hard_settings = HashMap::from([
             ("password".to_owned(), storage),
             ("salt".to_owned(), salt.to_owned()),
@@ -3419,7 +3418,7 @@ mod tests {
     #[test]
     fn test_plaintext_preset_with_hash_shape_and_no_salt_is_compared_literally() {
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
-        let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
+        let storage = "00".to_owned() + &BASE64.encode(h1);
         let hard_settings = HashMap::from([("password".to_owned(), storage.clone())]);
 
         let mut config = Config::default();
@@ -3517,16 +3516,13 @@ mod tests {
     fn test_validation_rejects_corrupted_general_encrypted_permanent_password_storage() {
         let encrypted_storage =
             encrypt_str_or_original("noncurrent-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        let mut invalid_payload = base64::decode(
-            &encrypted_storage.as_bytes()[PASSWORD_ENC_VERSION.len()..],
-            base64::Variant::Original,
-        )
-        .unwrap();
+        let mut invalid_payload = BASE64
+            .decode(&encrypted_storage.as_bytes()[PASSWORD_ENC_VERSION.len()..])
+            .unwrap();
         *invalid_payload.last_mut().unwrap() ^= 1;
 
         let mut cfg = Config::default();
-        cfg.password = PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
+        cfg.password = PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(invalid_payload);
         cfg.salt = "salt123".to_owned();
 
         assert!(Config::validate_permanent_password_storage(&cfg).is_err());
@@ -3549,8 +3545,7 @@ mod tests {
         let mut cfg = Config::default();
         let invalid_payload =
             crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
-        cfg.password = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
+        cfg.password = PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(invalid_payload);
         cfg.salt = "salt123".to_owned();
         cfg.id = "123456789".to_owned();
 
@@ -3701,7 +3696,7 @@ mod tests {
     #[test]
     fn test_validation_rejects_current_prefixed_non_hash_payload() {
         let mut cfg = Config::default();
-        let plain = "01".to_owned() + &base64::encode([42u8; 24], base64::Variant::Original);
+        let plain = "01".to_owned() + &BASE64.encode([42u8; 24]);
         cfg.password = plain.clone();
         cfg.salt = "salt123".to_owned();
 
@@ -3744,15 +3739,15 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_rejects_non_current_storage_payloads() {
-        let invalid_payload = vec![42u8; sodiumoxide::crypto::secretbox::MACBYTES + 1];
-        let invalid_storage = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
+        let invalid_payload = vec![42u8; crate::crypto::secretbox::MACBYTES + 1];
+        let invalid_storage =
+            PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(invalid_payload);
         let encrypted_noncurrent_plaintext =
             encrypt_str_or_original("noncurrent-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
 
         let encrypted = crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
-        let encrypted_non_hash = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(encrypted, base64::Variant::Original);
+        let encrypted_non_hash =
+            PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(encrypted);
         for storage in [
             "00secret",
             &encrypted_noncurrent_plaintext,

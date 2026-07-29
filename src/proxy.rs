@@ -119,7 +119,7 @@ impl Auth {
     }
 
     pub fn get_basic_authorization(&self) -> String {
-        let authorization = format!("{}:{}", &self.user_name, &self.password);
+        let authorization = format!("{}:{}", self.user_name, self.password);
         general_purpose::STANDARD.encode(authorization.as_bytes())
     }
 

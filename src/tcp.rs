@@ -1,12 +1,12 @@
+use crate::crypto::{
+    box_,
+    secretbox::{self, Key, Nonce},
+};
 use crate::{bail, bytes_codec::BytesCodec, config::Socks5Server, proxy::Proxy, ResultType};
 use anyhow::Context as AnyhowCtx;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use protobuf::Message;
-use sodiumoxide::crypto::{
-    box_,
-    secretbox::{self, Key, Nonce},
-};
 use std::{
     io::{self, Error},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -309,7 +309,7 @@ impl Encrypt {
                 bytes.put_slice(&res);
                 Ok(())
             }
-            Err(()) => Err(Error::other("decryption error")),
+            Err(_) => Err(Error::other("decryption error")),
         }
     }
 
