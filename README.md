@@ -11,6 +11,20 @@ No Camellia-operated network endpoint is compiled into the default build. A revi
 may set `CAMELLIA_REMOTE_UPDATE_URL` at build time to a version service that implements the bounded
 `VersionCheckRequest`/`VersionCheckResponse` contract. When it is unset, update checks remain offline.
 
+## Local secret-storage contract
+
+Optional empty values remain empty. Every non-empty local secret must use the current
+versioned, random-nonce authenticated-encryption envelope; plaintext, malformed,
+wrong-key, oversized, and already-encrypted inputs are rejected instead of being
+written back unchanged. Device identity and credential corruption therefore reset
+the affected value rather than creating a plaintext migration path.
+
+Provisioned permanent passwords must be supplied as the current H1 hash together
+with a non-empty salt. Plaintext preset passwords are not accepted. The local
+envelope is bound to the installation key pair and is intended to protect
+configuration at rest within the operating-system account boundary; deployment
+must also protect that account and its configuration directory.
+
 ## Development
 
 ```bash
