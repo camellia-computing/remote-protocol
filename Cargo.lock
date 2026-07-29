@@ -220,7 +220,6 @@ dependencies = [
  "flexi_logger",
  "futures",
  "futures-util",
- "getrandom 0.4.3",
  "hex-literal",
  "httparse",
  "lazy_static",

@@ -161,7 +161,7 @@ impl FramedStream {
     pub async fn send_raw(&mut self, msg: Vec<u8>) -> ResultType<()> {
         let mut msg = msg;
         if let Some(key) = self.2.as_mut() {
-            msg = key.enc(&msg);
+            msg = key.enc(&msg)?;
         }
         self.send_bytes(bytes::Bytes::from(msg)).await?;
         Ok(())
@@ -313,10 +313,10 @@ impl Encrypt {
         }
     }
 
-    pub fn enc(&mut self, data: &[u8]) -> Vec<u8> {
+    pub fn enc(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
         self.1 += 1;
         let nonce = FramedStream::get_nonce(self.1);
-        secretbox::seal(data, &nonce, &self.0)
+        secretbox::seal(data, &nonce, &self.0).map_err(|_| Error::other("encryption error"))
     }
 
     pub fn decode(

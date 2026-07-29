@@ -36,7 +36,6 @@ filetime = "0.2"
 crypto_box = "0.9.1"
 crypto_secretbox = "0.1.1"
 ed25519-dalek = "3.0.0"
-getrandom = "0.4.3"
 subtle = "2.6.1"
 zeroize = { version = "1.9.0", features = ["derive"] }
 regex = "1.11"

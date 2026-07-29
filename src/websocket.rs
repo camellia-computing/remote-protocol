@@ -175,7 +175,7 @@ impl WsFramedStream {
     pub async fn send_raw(&mut self, msg: Vec<u8>) -> ResultType<()> {
         let mut msg = msg;
         if let Some(key) = self.encrypt.as_mut() {
-            msg = key.enc(&msg);
+            msg = key.enc(&msg)?;
         }
         self.send_bytes(Bytes::from(msg)).await
     }

@@ -224,7 +224,7 @@ pub fn symmetric_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
 
     if encrypt {
         let nonce = secretbox::gen_nonce();
-        let encrypted = secretbox::seal(data, &nonce, &key);
+        let encrypted = secretbox::seal(data, &nonce, &key).map_err(|_| ())?;
         let mut output = Vec::with_capacity(1 + nonce.0.len() + encrypted.len());
         output.push(FORMAT_V1);
         output.extend(nonce.0);
@@ -485,7 +485,7 @@ mod test {
         keybuf.resize(secretbox::KEYBYTES, 0);
         let key = secretbox::Key(keybuf.try_into().unwrap());
         let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
-        let encrypted = secretbox::seal(data, &nonce, &key);
+        let encrypted = secretbox::seal(data, &nonce, &key).unwrap();
 
         assert!(symmetric_crypt(&encrypted, false).is_err());
     }
@@ -519,7 +519,7 @@ mod test {
         let mut pk_keybuf = pk;
         pk_keybuf.resize(secretbox::KEYBYTES, 0);
         let pk_key = secretbox::Key(pk_keybuf.try_into().unwrap());
-        let ciphertext = secretbox::seal(data, &nonce, &pk_key);
+        let ciphertext = secretbox::seal(data, &nonce, &pk_key).unwrap();
 
         let mut encrypted = Vec::with_capacity(1 + secretbox::NONCEBYTES + ciphertext.len());
         encrypted.push(FORMAT_V1);

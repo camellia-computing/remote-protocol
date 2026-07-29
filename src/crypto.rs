@@ -7,6 +7,8 @@
 pub enum CryptoError {
     #[error("cryptographic authentication failed")]
     Authentication,
+    #[error("cryptographic encryption failed")]
+    Encryption,
 }
 
 pub mod secretbox {
@@ -15,6 +17,7 @@ pub mod secretbox {
         aead::{Aead, KeyInit},
         XSalsa20Poly1305,
     };
+    use rand::{rngs::OsRng, RngCore};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     pub const KEYBYTES: usize = 32;
@@ -29,21 +32,21 @@ pub mod secretbox {
 
     pub fn gen_key() -> Key {
         let mut bytes = [0u8; KEYBYTES];
-        getrandom::fill(&mut bytes).expect("operating-system randomness is unavailable");
+        OsRng.fill_bytes(&mut bytes);
         Key(bytes)
     }
 
     pub fn gen_nonce() -> Nonce {
         let mut bytes = [0u8; NONCEBYTES];
-        getrandom::fill(&mut bytes).expect("operating-system randomness is unavailable");
+        OsRng.fill_bytes(&mut bytes);
         Nonce(bytes)
     }
 
-    pub fn seal(message: &[u8], nonce: &Nonce, key: &Key) -> Vec<u8> {
+    pub fn seal(message: &[u8], nonce: &Nonce, key: &Key) -> Result<Vec<u8>, CryptoError> {
         let cipher = XSalsa20Poly1305::new((&key.0).into());
         cipher
             .encrypt((&nonce.0).into(), message)
-            .expect("valid XSalsa20-Poly1305 inputs")
+            .map_err(|_| CryptoError::Encryption)
     }
 
     pub fn open(ciphertext: &[u8], nonce: &Nonce, key: &Key) -> Result<Vec<u8>, CryptoError> {
@@ -59,6 +62,7 @@ pub mod box_ {
     use crypto_box::{
         aead::Aead, PublicKey as RustCryptoPublicKey, SalsaBox, SecretKey as RustCryptoSecretKey,
     };
+    use rand::{rngs::OsRng, RngCore};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     pub const PUBLICKEYBYTES: usize = 32;
@@ -100,7 +104,7 @@ pub mod box_ {
 
     pub fn gen_keypair() -> (PublicKey, SecretKey) {
         let mut secret = [0u8; SECRETKEYBYTES];
-        getrandom::fill(&mut secret).expect("operating-system randomness is unavailable");
+        OsRng.fill_bytes(&mut secret);
         let private = RustCryptoSecretKey::from(secret);
         let public = private.public_key();
         (PublicKey(*public.as_bytes()), SecretKey(secret))
@@ -111,12 +115,12 @@ pub mod box_ {
         nonce: &Nonce,
         recipient: &PublicKey,
         sender: &SecretKey,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, CryptoError> {
         let recipient = RustCryptoPublicKey::from(recipient.0);
         let sender = RustCryptoSecretKey::from(sender.0);
         SalsaBox::new(&recipient, &sender)
             .encrypt((&nonce.0).into(), message)
-            .expect("valid crypto_box inputs")
+            .map_err(|_| CryptoError::Encryption)
     }
 
     pub fn open(
@@ -136,6 +140,7 @@ pub mod box_ {
 pub mod sign {
     use super::CryptoError;
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+    use rand::{rngs::OsRng, RngCore};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     pub const PUBLICKEYBYTES: usize = 32;
@@ -171,8 +176,9 @@ pub mod sign {
         }
 
         pub fn public_key(&self) -> PublicKey {
-            let signing_key = SigningKey::from_keypair_bytes(&self.0)
-                .expect("SecretKey is validated when constructed");
+            let mut seed = [0u8; SEEDBYTES];
+            seed.copy_from_slice(&self.0[..SEEDBYTES]);
+            let signing_key = SigningKey::from_bytes(&seed);
             PublicKey(signing_key.verifying_key().to_bytes())
         }
     }
@@ -194,7 +200,7 @@ pub mod sign {
 
     pub fn gen_keypair() -> (PublicKey, SecretKey) {
         let mut seed = [0u8; SEEDBYTES];
-        getrandom::fill(&mut seed).expect("operating-system randomness is unavailable");
+        OsRng.fill_bytes(&mut seed);
         keypair_from_seed(&Seed(seed))
     }
 
@@ -207,8 +213,9 @@ pub mod sign {
     }
 
     pub fn sign(message: &[u8], key: &SecretKey) -> Vec<u8> {
-        let signing_key = SigningKey::from_keypair_bytes(&key.0)
-            .expect("SecretKey is validated when constructed");
+        let mut seed = [0u8; SEEDBYTES];
+        seed.copy_from_slice(&key.0[..SEEDBYTES]);
+        let signing_key = SigningKey::from_bytes(&seed);
         let signature: Signature = signing_key.sign(message);
         let mut signed = Vec::with_capacity(SIGNATUREBYTES + message.len());
         signed.extend_from_slice(&signature.to_bytes());
@@ -262,7 +269,7 @@ mod tests {
             "b48eeee314a7cc8ab932164548e526ae90224368517acfeabd6bb3732bc0e9da99832b61ca01b6de"
             "56244a9e88d5f9b37973f622a43d14a6599b1f654cb45a74e355a5"
         );
-        let encrypted = secretbox::seal(&plaintext, &nonce, &key);
+        let encrypted = secretbox::seal(&plaintext, &nonce, &key).unwrap();
         assert_eq!(encrypted, expected);
         assert_eq!(
             secretbox::open(&encrypted, &nonce, &key),
@@ -285,7 +292,8 @@ mod tests {
             "e8980c86e032f1eb2975052e8d65bddd15c3b59641174ec9678a53789d92c754"
         ));
         let nonce = box_::Nonce(hex!("69696ee955b62b73cd62bda875fc73d68219e0036b7a0b37"));
-        let encrypted = box_::seal(b"current-protocol", &nonce, &bob_public, &alice_secret);
+        let encrypted =
+            box_::seal(b"current-protocol", &nonce, &bob_public, &alice_secret).unwrap();
         assert_eq!(
             box_::open(&encrypted, &nonce, &alice_public, &bob_secret),
             Ok(b"current-protocol".to_vec())
