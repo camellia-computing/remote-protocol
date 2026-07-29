@@ -57,6 +57,10 @@ jobs:
           python3 -m json.tool SOURCE_PROVENANCE.json >/dev/null
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Install pinned dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+      - name: Audit locked dependencies
+        run: cargo audit --deny warnings
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
