@@ -337,8 +337,17 @@ pub fn get_uuid() -> Vec<u8> {
             INIT.call_once(|| {
                 // Keep in sync with upstream handling:
                 // https://github.com/rustdesk/rustdesk/blob/85db6779828349b23ca3eba91cc7cd36c5337797/src/common.rs#L822
-                let username = whoami::username().trim_end_matches('\0').to_owned();
-                let max_retries = if username == "root" { 16 } else { 8 };
+                let is_root = match whoami::username() {
+                    Ok(username) => username.trim_end_matches('\0') == "root",
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to determine the current macOS user for machine UID retries: \
+                             {error}"
+                        );
+                        false
+                    }
+                };
+                let max_retries = if is_root { 16 } else { 8 };
                 for i in 0..max_retries {
                     match machine_uid::get() {
                         Ok(id) => {
