@@ -59,7 +59,7 @@ tokio-rustls = { version = "0.26", features = [
     "ring",
 ], default-features = false }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
 rustls-platform-verifier = "0.6"
 rustls-pki-types = "1.11"
 rustls-native-certs = "0.8"
