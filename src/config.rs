@@ -1060,7 +1060,7 @@ impl Config {
             .map(|v| option2bool(keys::OPTION_ALLOW_HOSTNAME_AS_ID, v))
             .unwrap_or(false);
         if hostname_as_id {
-            match whoami::fallible::hostname() {
+            match whoami::hostname() {
                 Ok(h) => Some(h.replace(" ", "-")),
                 Err(e) => {
                     log::warn!("Failed to get hostname, \"{}\", fallback to auto id", e);
