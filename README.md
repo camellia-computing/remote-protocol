@@ -7,9 +7,13 @@ The repository is versioned independently and consumed at an exact Git commit. E
 wire constants and protobuf fields are retained where they are required for client/server protocol
 operation; they are not product branding or a compatibility promise for pre-release local data.
 
-No Camellia-operated network endpoint is compiled into the default build. A reviewed client release
-may set `CAMELLIA_REMOTE_UPDATE_URL` at build time to a version service that implements the bounded
-`VersionCheckRequest`/`VersionCheckResponse` contract. When it is unset, update checks remain offline.
+No Camellia-operated network endpoint is compiled into the default build. The
+shared contract intentionally exposes no version-service or auto-update API:
+client releases are discovered and installed only through their reviewed,
+immutable release process. Client-owned help links are supplied through
+`CAMELLIA_REMOTE_DOCS_HOME_URL` and
+`CAMELLIA_REMOTE_LINUX_DISPLAY_DOCS_URL`; the shared protocol never embeds an
+organization login or a consumer repository name.
 
 ## Local secret-storage contract
 

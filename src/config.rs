@@ -96,11 +96,16 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
-pub const LINK_DOCS_HOME: &str = "https://github.com/camellia-computing/remote-client";
-pub const LINK_DOCS_X11_REQUIRED: &str =
-    "https://github.com/camellia-computing/remote-client/issues";
-pub const LINK_HEADLESS_LINUX_SUPPORT: &str =
-    "https://github.com/camellia-computing/remote-client/issues";
+pub const LINK_DOCS_HOME: &str = match option_env!("CAMELLIA_REMOTE_DOCS_HOME_URL") {
+    Some(value) => value,
+    None => "",
+};
+pub const LINK_DOCS_X11_REQUIRED: &str = match option_env!("CAMELLIA_REMOTE_LINUX_DISPLAY_DOCS_URL")
+{
+    Some(value) => value,
+    None => "",
+};
+pub const LINK_HEADLESS_LINUX_SUPPORT: &str = LINK_DOCS_X11_REQUIRED;
 
 lazy_static::lazy_static! {
     pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([
@@ -2904,8 +2909,6 @@ pub mod keys {
         "enable-open-new-connections-in-tabs";
     pub const OPTION_TEXTURE_RENDER: &str = "use-texture-render";
     pub const OPTION_ALLOW_D3D_RENDER: &str = "allow-d3d-render";
-    pub const OPTION_ALLOW_CHECK_UPDATE: &str = "allow-check-update";
-    pub const OPTION_ALLOW_AUTO_UPDATE: &str = "allow-auto-update";
     pub const OPTION_SYNC_AB_WITH_RECENT_SESSIONS: &str = "sync-ab-with-recent-sessions";
     pub const OPTION_SYNC_AB_TAGS: &str = "sync-ab-tags";
     pub const OPTION_FILTER_AB_BY_INTERSECTION: &str = "filter-ab-by-intersection";
@@ -3206,7 +3209,6 @@ pub mod keys {
         OPTION_ICE_SERVERS,
         OPTION_DISABLE_UDP,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
-        OPTION_ALLOW_AUTO_UPDATE,
     ];
 
     // BUILDIN_SETTINGS
