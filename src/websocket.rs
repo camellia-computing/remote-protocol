@@ -15,11 +15,14 @@ use futures::{SinkExt, StreamExt};
 use std::{io::Error, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    connect_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
-    MaybeTlsStream, WebSocketStream,
+    connect_async_tls_with_config,
+    tungstenite::{
+        self,
+        client::IntoClientRequest,
+        protocol::{Message as WsMessage, Role},
+    },
+    Connector, MaybeTlsStream, WebSocketStream,
 };
-use tungstenite::client::IntoClientRequest;
-use tungstenite::protocol::Role;
 
 pub struct WsFramedStream {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
