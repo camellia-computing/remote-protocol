@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod crypto;
 pub mod platform;
 pub mod protos;
 pub use bytes;
@@ -7,7 +8,6 @@ pub use futures;
 pub use protobuf;
 pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
-use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{self, BufRead},
@@ -34,7 +34,6 @@ pub use lazy_static;
 pub use mac_address;
 pub use rand;
 pub use regex;
-pub use sodiumoxide;
 pub use tokio_socks;
 pub use tokio_socks::IntoTargetAddr;
 pub use tokio_socks::TargetAddr;
@@ -477,56 +476,6 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         }
     });
     logger_holder
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct VersionCheckRequest {
-    #[serde(default)]
-    pub os: String,
-    #[serde(default)]
-    pub os_version: String,
-    #[serde(default)]
-    pub arch: String,
-    #[serde(default)]
-    pub device_id: Vec<u8>,
-    #[serde(default)]
-    pub typ: String,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct VersionCheckResponse {
-    #[serde(default)]
-    pub url: String,
-}
-
-pub const VER_TYPE_CAMELLIA_REMOTE_CLIENT: &str = "camellia-remote-client";
-
-pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
-    // No vendor endpoint is compiled into development builds. A release that
-    // enables update checks must provide its reviewed HTTPS endpoint at build
-    // time; an empty value keeps the client entirely offline for this feature.
-    const URL: &str = match option_env!("CAMELLIA_REMOTE_UPDATE_URL") {
-        Some(value) => value,
-        None => "",
-    };
-
-    use sysinfo::System;
-    let system = System::new();
-    let os = system.distribution_id();
-    let os_version = system.os_version().unwrap_or_default();
-    let arch = std::env::consts::ARCH.to_string();
-    #[allow(deprecated)]
-    let device_id = fingerprint::get_fingerprint(None, None);
-    (
-        VersionCheckRequest {
-            os,
-            os_version,
-            arch,
-            device_id,
-            typ,
-        },
-        URL.to_string(),
-    )
 }
 
 pub fn time_based_rand() -> u32 {

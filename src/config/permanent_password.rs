@@ -1,16 +1,17 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
-use sodiumoxide::base64;
 
-use crate::password_security::symmetric_crypt;
+use crate::{
+    crypto::constant_time_eq,
+    password_security::{decrypt_local, encrypt_local, SecretStorageError},
+};
 
-pub(super) const PASSWORD_ENC_VERSION: &str = "00";
 pub(super) const PERMANENT_PASSWORD_ENC_VERSION: &str = "01";
 pub(super) const PERMANENT_PASSWORD_HASH_PREFIX: &str = "00";
 const HBBS_PRESET_PASSWORD_HASH_PREFIX: &str = "00";
 pub(super) const PERMANENT_PASSWORD_H1_LEN: usize = 32;
 pub(super) const DEFAULT_SALT_LEN: usize = 32;
 pub const ENCRYPT_MAX_LEN: usize = 128; // used for password, pin, etc, not for all
-const VERSION_LEN: usize = 2;
 
 #[cfg(test)]
 pub(super) fn is_permanent_password_hashed_storage(v: &str) -> bool {
@@ -31,13 +32,13 @@ pub fn compute_permanent_password_h1(
 }
 
 pub(super) fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    sodiumoxide::utils::memcmp(a, b)
+    constant_time_eq(a, b)
 }
 
 pub(super) fn encode_permanent_password_storage_from_h1(
     h1: &[u8; PERMANENT_PASSWORD_H1_LEN],
 ) -> String {
-    PERMANENT_PASSWORD_HASH_PREFIX.to_owned() + &base64::encode(h1, base64::Variant::Original)
+    PERMANENT_PASSWORD_HASH_PREFIX.to_owned() + &BASE64.encode(h1)
 }
 
 pub(super) fn encode_permanent_password_encrypted_storage_from_h1(
@@ -59,7 +60,7 @@ fn decode_password_h1_after_prefix(
 ) -> Option<[u8; PERMANENT_PASSWORD_H1_LEN]> {
     let encoded = storage.strip_prefix(prefix)?;
 
-    let v = base64::decode(encoded.as_bytes(), base64::Variant::Original).ok()?;
+    let v = BASE64.decode(encoded.as_bytes()).ok()?;
     if v.len() != PERMANENT_PASSWORD_H1_LEN {
         return None;
     }
@@ -72,25 +73,22 @@ fn encrypt_permanent_password_storage(storage: &str) -> Option<String> {
     if storage.chars().count() > ENCRYPT_MAX_LEN {
         return None;
     }
-    let encrypted = symmetric_crypt(storage.as_bytes(), true).ok()?;
-    Some(
-        PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(encrypted, base64::Variant::Original),
-    )
+    let encrypted = encrypt_local(storage.as_bytes()).ok()?;
+    Some(PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(encrypted))
 }
 
-pub(super) fn decrypt_permanent_password_str_or_original(storage: &str) -> (String, bool, bool) {
-    if storage.len() > VERSION_LEN && storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
-        if let Ok(decoded) = base64::decode(
-            &storage.as_bytes()[VERSION_LEN..],
-            base64::Variant::Original,
-        ) {
-            if let Ok(v) = symmetric_crypt(&decoded, false) {
-                return (String::from_utf8_lossy(&v).to_string(), true, false);
-            }
-        }
-    }
-    (storage.to_owned(), false, !storage.is_empty())
+pub(super) fn decrypt_permanent_password_storage(
+    storage: &str,
+) -> Result<String, SecretStorageError> {
+    let encoded = storage
+        .as_bytes()
+        .strip_prefix(PERMANENT_PASSWORD_ENC_VERSION.as_bytes())
+        .ok_or(SecretStorageError::UnsupportedVersion)?;
+    let encrypted = BASE64
+        .decode(encoded)
+        .map_err(|_| SecretStorageError::InvalidEncoding)?;
+    let plaintext = decrypt_local(&encrypted)?;
+    String::from_utf8(plaintext).map_err(|_| SecretStorageError::InvalidUtf8)
 }
 
 pub fn local_permanent_password_storage_is_usable_for_auth(storage: &str, salt: &str) -> bool {
@@ -98,13 +96,7 @@ pub fn local_permanent_password_storage_is_usable_for_auth(storage: &str, salt: 
 }
 
 pub fn preset_permanent_password_storage_is_usable_for_auth(storage: &str, salt: &str) -> bool {
-    if storage.is_empty() {
-        return false;
-    }
-    if salt.is_empty() {
-        return true;
-    }
-    decode_preset_password_h1_from_storage(storage).is_some()
+    !salt.is_empty() && decode_preset_password_h1_from_storage(storage).is_some()
 }
 
 pub fn decode_preset_password_h1_from_storage(
@@ -133,11 +125,8 @@ pub(super) fn preset_permanent_password_storage_matches_plain(
     salt: &str,
     input: &str,
 ) -> bool {
-    if storage.is_empty() || input.is_empty() {
+    if storage.is_empty() || salt.is_empty() || input.is_empty() {
         return false;
-    }
-    if salt.is_empty() {
-        return storage == input;
     }
     let Some(stored_h1) = decode_preset_password_h1_from_storage(storage) else {
         return false;
@@ -150,10 +139,7 @@ pub fn decode_permanent_password_h1_from_storage(
     storage: &str,
 ) -> Option<[u8; PERMANENT_PASSWORD_H1_LEN]> {
     if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
-        let (hashed_storage, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
-        if !decrypted {
-            return None;
-        }
+        let hashed_storage = decrypt_permanent_password_storage(storage).ok()?;
         return decode_permanent_password_h1_from_hashed_storage(&hashed_storage);
     }
     None
@@ -164,7 +150,7 @@ mod tests {
     use super::*;
 
     fn encode_hbbs_preset_password_storage_from_h1(h1: &[u8; PERMANENT_PASSWORD_H1_LEN]) -> String {
-        HBBS_PRESET_PASSWORD_HASH_PREFIX.to_owned() + &base64::encode(h1, base64::Variant::Original)
+        HBBS_PRESET_PASSWORD_HASH_PREFIX.to_owned() + &BASE64.encode(h1)
     }
 
     #[test]
@@ -187,9 +173,7 @@ mod tests {
         assert!(storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION));
         assert!(!is_permanent_password_hashed_storage(&storage));
 
-        let (inner, decrypted, should_store) = decrypt_permanent_password_str_or_original(&storage);
-        assert!(decrypted);
-        assert!(!should_store);
+        let inner = decrypt_permanent_password_storage(&storage).unwrap();
         assert!(inner.starts_with(PERMANENT_PASSWORD_HASH_PREFIX));
         assert_eq!(
             decode_permanent_password_h1_from_storage(&storage),
@@ -254,14 +238,14 @@ mod tests {
     }
 
     #[test]
-    fn test_hbbs_00_shaped_preset_password_without_salt_stays_plaintext() {
+    fn test_hashed_preset_password_without_salt_is_rejected() {
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = encode_hbbs_preset_password_storage_from_h1(&h1);
 
-        assert!(preset_permanent_password_storage_is_usable_for_auth(
+        assert!(!preset_permanent_password_storage_is_usable_for_auth(
             &storage, ""
         ));
-        assert!(preset_permanent_password_storage_matches_plain(
+        assert!(!preset_permanent_password_storage_matches_plain(
             &storage, "", &storage
         ));
         assert!(!preset_permanent_password_storage_matches_plain(
@@ -283,13 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn test_plaintext_preset_without_salt_is_compared_literally() {
+    fn test_plaintext_preset_without_salt_is_rejected() {
         let storage = "01not-a-valid-hash";
 
-        assert!(preset_permanent_password_storage_is_usable_for_auth(
+        assert!(!preset_permanent_password_storage_is_usable_for_auth(
             storage, ""
         ));
-        assert!(preset_permanent_password_storage_matches_plain(
+        assert!(!preset_permanent_password_storage_matches_plain(
             storage,
             "",
             "01not-a-valid-hash"
@@ -313,9 +297,9 @@ mod tests {
 
     #[test]
     fn test_invalid_current_version_storage_is_not_usable_for_auth() {
-        let encrypted = symmetric_crypt(b"not-a-hash", true).unwrap();
-        let encrypted_non_hash = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(encrypted, base64::Variant::Original);
+        let encrypted = encrypt_local(b"not-a-hash").unwrap();
+        let encrypted_non_hash =
+            PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(encrypted);
 
         assert!(!local_permanent_password_storage_is_usable_for_auth(
             &encrypted_non_hash,

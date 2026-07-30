@@ -1,12 +1,12 @@
+use crate::crypto::{
+    box_,
+    secretbox::{self, Key, Nonce},
+};
 use crate::{bail, bytes_codec::BytesCodec, config::Socks5Server, proxy::Proxy, ResultType};
 use anyhow::Context as AnyhowCtx;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use protobuf::Message;
-use sodiumoxide::crypto::{
-    box_,
-    secretbox::{self, Key, Nonce},
-};
 use std::{
     io::{self, Error},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -161,7 +161,7 @@ impl FramedStream {
     pub async fn send_raw(&mut self, msg: Vec<u8>) -> ResultType<()> {
         let mut msg = msg;
         if let Some(key) = self.2.as_mut() {
-            msg = key.enc(&msg);
+            msg = key.enc(&msg)?;
         }
         self.send_bytes(bytes::Bytes::from(msg)).await?;
         Ok(())
@@ -309,14 +309,14 @@ impl Encrypt {
                 bytes.put_slice(&res);
                 Ok(())
             }
-            Err(()) => Err(Error::other("decryption error")),
+            Err(_) => Err(Error::other("decryption error")),
         }
     }
 
-    pub fn enc(&mut self, data: &[u8]) -> Vec<u8> {
+    pub fn enc(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
         self.1 += 1;
         let nonce = FramedStream::get_nonce(self.1);
-        secretbox::seal(data, &nonce, &self.0)
+        secretbox::seal(data, &nonce, &self.0).map_err(|_| Error::other("encryption error"))
     }
 
     pub fn decode(

@@ -3,7 +3,6 @@
   "component": "camellia-remote-protocol",
   "source_repository": "https://github.com/XavierAlpha/hbb_common",
   "source_commit": "343e2b92d597076318ffac226d718e9484e3bf6c",
-  "normalized_repository": "https://github.com/camellia-computing/remote-protocol",
   "history_policy": "fresh-root-snapshot",
   "license": "AGPL-3.0-only"
 }

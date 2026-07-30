@@ -3,9 +3,9 @@ name = "camellia-remote-protocol"
 version = "0.1.0"
 authors = ["Camellia Computing", "RustDesk contributors"]
 edition = "2021"
+rust-version = "1.97"
 description = "Shared protocol, transport, configuration, and file-transfer contracts for Camellia Remote"
 license = "AGPL-3.0-only"
-repository = "https://github.com/camellia-computing/remote-protocol"
 readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -32,7 +32,11 @@ lazy_static = "1.5"
 confy = { git = "https://github.com/rustdesk-org/confy", rev = "83db9ec19a2f97e9718aef69e4fc5611bb382479" }
 dirs-next = "2.0"
 filetime = "0.2"
-sodiumoxide = "0.2"
+crypto_box = "0.9.1"
+crypto_secretbox = "0.1.1"
+ed25519-dalek = "3.0.0"
+subtle = "2.6.1"
+zeroize = { version = "1.9.0", features = ["derive"] }
 regex = "1.11"
 tokio-socks = { git = "https://github.com/rustdesk-org/tokio-socks", rev = "bdb9aa3de5bac41602d0742b8ef6bbc6bfebd127" }
 chrono = "0.4"
@@ -72,6 +76,7 @@ protobuf-codegen = { version = "3.7" }
 
 [dev-dependencies]
 clap = "4.5.51"
+hex-literal = "1.0.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = [

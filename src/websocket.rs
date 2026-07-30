@@ -2,9 +2,9 @@ use crate::{
     config::{
         keys::OPTION_RELAY_SERVER, use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
     },
+    crypto::secretbox::Key,
     protobuf::Message,
     socket_client::split_host_port,
-    sodiumoxide::crypto::secretbox::Key,
     tcp::Encrypt,
     tls::{get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
@@ -175,7 +175,7 @@ impl WsFramedStream {
     pub async fn send_raw(&mut self, msg: Vec<u8>) -> ResultType<()> {
         let mut msg = msg;
         if let Some(key) = self.encrypt.as_mut() {
-            msg = key.enc(&msg);
+            msg = key.enc(&msg)?;
         }
         self.send_bytes(Bytes::from(msg)).await
     }

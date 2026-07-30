@@ -10,14 +10,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
 use rand::Rng;
 use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
-use sodiumoxide::base64;
-use sodiumoxide::crypto::sign;
 
 mod permanent_password;
 
@@ -28,15 +27,16 @@ pub use permanent_password::{
 };
 use permanent_password::{
     encode_permanent_password_encrypted_storage_from_h1,
-    preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
+    preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN,
 };
 
 use crate::{
     compress::{compress, decompress},
+    crypto::sign,
     log,
     password_security::{
-        decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
-        encrypt_vec_or_original, symmetric_crypt,
+        decrypt_local, decrypt_str, decrypt_vec, encrypt_local, encrypt_str, encrypt_vec,
+        SecretStorageError,
     },
 };
 
@@ -96,11 +96,16 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
-pub const LINK_DOCS_HOME: &str = "https://github.com/camellia-computing/remote-client";
-pub const LINK_DOCS_X11_REQUIRED: &str =
-    "https://github.com/camellia-computing/remote-client/issues";
-pub const LINK_HEADLESS_LINUX_SUPPORT: &str =
-    "https://github.com/camellia-computing/remote-client/issues";
+pub const LINK_DOCS_HOME: &str = match option_env!("CAMELLIA_REMOTE_DOCS_HOME_URL") {
+    Some(value) => value,
+    None => "",
+};
+pub const LINK_DOCS_X11_REQUIRED: &str = match option_env!("CAMELLIA_REMOTE_LINUX_DISPLAY_DOCS_URL")
+{
+    Some(value) => value,
+    None => "",
+};
+pub const LINK_HEADLESS_LINUX_SUPPORT: &str = LINK_DOCS_X11_REQUIRED;
 
 lazy_static::lazy_static! {
     pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([
@@ -525,16 +530,24 @@ impl Config2 {
         let mut config = Config::load_::<Config2>("2");
         let mut store = false;
         if let Some(mut socks) = config.socks {
-            let (password, _, store2) =
-                decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
-            socks.password = password;
+            match decrypt_str(&socks.password) {
+                Ok(password) => socks.password = password,
+                Err(err) => {
+                    log::error!("Clearing invalid SOCKS password storage: {err}");
+                    socks.password.clear();
+                    store = true;
+                }
+            }
             config.socks = Some(socks);
-            store |= store2;
         }
-        let (unlock_pin, _, store2) =
-            decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
-        config.unlock_pin = unlock_pin;
-        store |= store2;
+        match decrypt_str(&config.unlock_pin) {
+            Ok(unlock_pin) => config.unlock_pin = unlock_pin,
+            Err(err) => {
+                log::error!("Clearing invalid unlock PIN storage: {err}");
+                config.unlock_pin.clear();
+                store = true;
+            }
+        }
         if store {
             config.store();
         }
@@ -554,12 +567,24 @@ impl Config2 {
                 .as_ref()
                 .map(|socks| socks.password.as_str())
                 .unwrap_or_default();
-            socks.password =
-                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
+            let Ok(password) =
+                encrypted_storage_for_plaintext(&socks.password, stored_password, ENCRYPT_MAX_LEN)
+            else {
+                log::error!("Refusing to store Config2 because the SOCKS password is invalid");
+                return;
+            };
+            socks.password = password;
             config.socks = Some(socks);
         }
-        config.unlock_pin =
-            keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
+        let Ok(unlock_pin) = encrypted_storage_for_plaintext(
+            &config.unlock_pin,
+            &stored.unlock_pin,
+            ENCRYPT_MAX_LEN,
+        ) else {
+            log::error!("Refusing to store Config2 because the unlock PIN is invalid");
+            return;
+        };
+        config.unlock_pin = unlock_pin;
         Config::store_(&config, "2");
     }
 
@@ -578,12 +603,15 @@ impl Config2 {
     }
 }
 
-fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
-    let (stored_plain, encrypted, _) = decrypt_str_or_original(stored, PASSWORD_ENC_VERSION);
-    if encrypted && stored_plain == plain {
-        return stored.to_owned();
+fn encrypted_storage_for_plaintext(
+    plain: &str,
+    stored: &str,
+    max_len: usize,
+) -> Result<String, SecretStorageError> {
+    if decrypt_str(stored).is_ok_and(|stored_plain| stored_plain == plain) {
+        return Ok(stored.to_owned());
     }
-    encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+    encrypt_str(plain, max_len)
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -650,11 +678,13 @@ impl Config {
             store = true;
         }
         let mut id_valid = false;
-        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
-        if encrypted {
-            config.id = id;
-            id_valid = true;
-            store |= store2;
+        match decrypt_str(&config.enc_id) {
+            Ok(id) if !id.is_empty() => {
+                config.id = id;
+                id_valid = true;
+            }
+            Ok(_) => {}
+            Err(err) => log::warn!("Stored device ID is invalid: {err}"),
         }
         if !id_valid {
             log::warn!("ID is invalid, generating new one");
@@ -720,11 +750,12 @@ impl Config {
     fn store(&self) {
         let mut config = self.clone();
         Self::prepare_config_for_store(&mut config);
-        let (stored_id, encrypted, _) =
-            decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
-        if !encrypted || stored_id != config.id {
-            config.enc_id =
-                encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        if decrypt_str(&config.enc_id).as_deref() != Ok(config.id.as_str()) {
+            let Ok(enc_id) = encrypt_str(&config.id, ENCRYPT_MAX_LEN) else {
+                log::error!("Refusing to store config because the device ID cannot be encrypted");
+                return;
+            };
+            config.enc_id = enc_id;
         }
         config.id = "".to_owned();
         Config::store_(&config, "");
@@ -1138,27 +1169,6 @@ impl Config {
         KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
     }
 
-    /// Get existing key pair without generating a new one.
-    /// Returns None if no key pair exists in cache or config file.
-    pub fn get_existing_key_pair() -> Option<KeyPair> {
-        let mut lock = KEY_PAIR.lock().unwrap();
-        if let Some(p) = lock.as_ref() {
-            return Some(p.clone());
-        }
-
-        // IMPORTANT: this path is called while holding KEY_PAIR lock.
-        // Config::load_ must remain a raw conf load/deserialize path and must never
-        // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
-        // can re-enter key loading and deadlock.
-        let config = Config::load_::<Config>("");
-        if !config.key_pair.0.is_empty() {
-            *lock = Some(config.key_pair.clone());
-            Some(config.key_pair)
-        } else {
-            None
-        }
-    }
-
     pub fn no_register_device() -> bool {
         BUILTIN_SETTINGS
             .read()
@@ -1422,13 +1432,10 @@ impl Config {
             return String::new();
         }
         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
-        if !preset_salt.is_empty() {
-            if preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt) {
-                return preset_salt;
-            }
-            return String::new();
+        if preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt) {
+            return preset_salt;
         }
-        Self::get_salt()
+        String::new()
     }
 
     pub fn has_local_permanent_password() -> bool {
@@ -1592,21 +1599,23 @@ impl Config {
         if synced {
             return devices;
         }
-        let devices = CONFIG2.read().unwrap().trusted_devices.clone();
-        let (devices, succ, store) = decrypt_str_or_original(&devices, PASSWORD_ENC_VERSION);
-        if succ {
-            let mut devices: Vec<TrustedDevice> =
-                serde_json::from_str(&devices).unwrap_or_default();
-            let len = devices.len();
-            devices.retain(|d| !d.outdate());
-            if store || devices.len() != len {
-                Self::set_trusted_devices(devices.clone());
+        let storage = CONFIG2.read().unwrap().trusted_devices.clone();
+        let plaintext = match decrypt_str(&storage) {
+            Ok(plaintext) => plaintext,
+            Err(err) => {
+                log::error!("Clearing invalid trusted-device storage: {err}");
+                Self::set_trusted_devices(Vec::new());
+                return Vec::new();
             }
-            *TRUSTED_DEVICES.write().unwrap() = (devices.clone(), true);
-            devices
-        } else {
-            Default::default()
+        };
+        let mut devices: Vec<TrustedDevice> = serde_json::from_str(&plaintext).unwrap_or_default();
+        let len = devices.len();
+        devices.retain(|d| !d.outdate());
+        if devices.len() != len {
+            Self::set_trusted_devices(devices.clone());
         }
+        *TRUSTED_DEVICES.write().unwrap() = (devices.clone(), true);
+        devices
     }
 
     fn set_trusted_devices(mut trusted_devices: Vec<TrustedDevice>) {
@@ -1617,7 +1626,10 @@ impl Config {
             log::error!("Trusted devices too large: {}", devices.len());
             return;
         }
-        let devices = encrypt_str_or_original(&devices, PASSWORD_ENC_VERSION, max_len);
+        let Ok(devices) = encrypt_str(&devices, max_len) else {
+            log::error!("Failed to encrypt trusted devices");
+            return;
+        };
         let mut config = CONFIG2.write().unwrap();
         config.trusted_devices = devices;
         config.store();
@@ -1702,16 +1714,26 @@ impl PeerConfig {
             Ok(config) => {
                 let mut config: PeerConfig = config;
                 let mut store = false;
-                let (password, _, store2) =
-                    decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
-                config.password = password;
-                store = store || store2;
+                match decrypt_vec(&config.password) {
+                    Ok(password) => config.password = password,
+                    Err(err) => {
+                        log::error!("Clearing invalid password storage for peer '{id}': {err}");
+                        config.password.clear();
+                        store = true;
+                    }
+                }
                 for opt in ["rdp_password", "os-username", "os-password"] {
                     if let Some(v) = config.options.get_mut(opt) {
-                        let (encrypted, _, store2) =
-                            decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
-                        *v = encrypted;
-                        store = store || store2;
+                        match decrypt_str(v) {
+                            Ok(plaintext) => *v = plaintext,
+                            Err(err) => {
+                                log::error!(
+                                    "Clearing invalid '{opt}' storage for peer '{id}': {err}"
+                                );
+                                v.clear();
+                                store = true;
+                            }
+                        }
                     }
                 }
                 if store {
@@ -1738,11 +1760,18 @@ impl PeerConfig {
 
     fn store_(&self, id: &str) {
         let mut config = self.clone();
-        config.password =
-            encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let Ok(password) = encrypt_vec(&config.password, ENCRYPT_MAX_LEN) else {
+            log::error!("Refusing to store peer '{id}': password encryption failed");
+            return;
+        };
+        config.password = password;
         for opt in ["rdp_password", "os-username", "os-password"] {
             if let Some(v) = config.options.get_mut(opt) {
-                *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+                let Ok(storage) = encrypt_str(v, ENCRYPT_MAX_LEN) else {
+                    log::error!("Refusing to store peer '{id}': '{opt}' encryption failed");
+                    return;
+                };
+                *v = storage;
             }
         }
         if let Err(err) = store_path(Self::path(id), config) {
@@ -1761,7 +1790,7 @@ impl PeerConfig {
         let path: PathBuf;
         if let Ok(forbidden_paths) = forbidden_paths {
             let id_encoded = if forbidden_paths.is_match(id) {
-                "base64_".to_string() + base64::encode(id, base64::Variant::Original).as_str()
+                "base64_".to_string() + BASE64.encode(id).as_str()
             } else {
                 id.to_string()
             };
@@ -1807,8 +1836,7 @@ impl PeerConfig {
                         .to_owned();
 
                     let id_decoded_string = if id.starts_with("base64_") && id.len() != 7 {
-                        let id_decoded =
-                            base64::decode(&id[7..], base64::Variant::Original).unwrap_or_default();
+                        let id_decoded = BASE64.decode(&id[7..]).unwrap_or_default();
                         String::from_utf8_lossy(&id_decoded).as_ref().to_owned()
                     } else {
                         id
@@ -1826,7 +1854,7 @@ impl PeerConfig {
                     (id, t, p)
                 })
                 .collect::<Vec<_>>();
-            vec_id_modified_time_path.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            vec_id_modified_time_path.sort_unstable_by_key(|item| std::cmp::Reverse(item.1));
             vec_id_modified_time_path
         } else {
             vec![]
@@ -2547,7 +2575,7 @@ impl Ab {
                 log::error!("ab data too large, {} > {}", data.len(), max_len);
                 return;
             }
-            if let Ok(data) = symmetric_crypt(&data, true) {
+            if let Ok(data) = encrypt_local(&data) {
                 file.write_all(&data).ok();
             }
         };
@@ -2557,7 +2585,7 @@ impl Ab {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                if let Ok(data) = decrypt_local(&data) {
                     let data = decompress(&data);
                     if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
                         return ab;
@@ -2676,7 +2704,7 @@ impl Group {
                 // maxlen of function decompress
                 return;
             }
-            if let Ok(data) = symmetric_crypt(&data, true) {
+            if let Ok(data) = encrypt_local(&data) {
                 file.write_all(&data).ok();
             }
         };
@@ -2686,7 +2714,7 @@ impl Group {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                if let Ok(data) = decrypt_local(&data) {
                     let data = decompress(&data);
                     if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
                     {
@@ -2881,8 +2909,6 @@ pub mod keys {
         "enable-open-new-connections-in-tabs";
     pub const OPTION_TEXTURE_RENDER: &str = "use-texture-render";
     pub const OPTION_ALLOW_D3D_RENDER: &str = "allow-d3d-render";
-    pub const OPTION_ALLOW_CHECK_UPDATE: &str = "allow-check-update";
-    pub const OPTION_ALLOW_AUTO_UPDATE: &str = "allow-auto-update";
     pub const OPTION_SYNC_AB_WITH_RECENT_SESSIONS: &str = "sync-ab-with-recent-sessions";
     pub const OPTION_SYNC_AB_TAGS: &str = "sync-ab-tags";
     pub const OPTION_FILTER_AB_BY_INTERSECTION: &str = "filter-ab-by-intersection";
@@ -3183,7 +3209,6 @@ pub mod keys {
         OPTION_ICE_SERVERS,
         OPTION_DISABLE_UDP,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
-        OPTION_ALLOW_AUTO_UPDATE,
     ];
 
     // BUILDIN_SETTINGS
@@ -3277,6 +3302,7 @@ impl Status {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
+    use crate::password_security::SECRET_STORAGE_VERSION;
     use std::{
         ffi::OsString,
         sync::{
@@ -3402,7 +3428,7 @@ mod tests {
     fn test_hbbs_00_hashed_preset_password_storage_matches_plain_with_salt() {
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
-        let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
+        let storage = "00".to_owned() + &BASE64.encode(h1);
         let hard_settings = HashMap::from([
             ("password".to_owned(), storage),
             ("salt".to_owned(), salt.to_owned()),
@@ -3417,19 +3443,19 @@ mod tests {
     }
 
     #[test]
-    fn test_plaintext_preset_with_hash_shape_and_no_salt_is_compared_literally() {
+    fn test_preset_hash_without_salt_is_rejected() {
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
-        let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
+        let storage = "00".to_owned() + &BASE64.encode(h1);
         let hard_settings = HashMap::from([("password".to_owned(), storage.clone())]);
 
         let mut config = Config::default();
         config.salt = "local1".to_owned();
 
         with_config_and_hard_settings(config, hard_settings, || {
-            assert!(Config::has_permanent_password());
-            assert!(Config::has_usable_preset_password());
-            assert!(Config::is_using_preset_password());
-            assert_eq!(Config::get_effective_permanent_password_salt(), "local1");
+            assert!(!Config::has_permanent_password());
+            assert!(!Config::has_usable_preset_password());
+            assert!(!Config::is_using_preset_password());
+            assert_eq!(Config::get_effective_permanent_password_salt(), "");
         });
     }
 
@@ -3462,15 +3488,15 @@ mod tests {
     }
 
     #[test]
-    fn test_plaintext_preset_uses_local_salt_for_challenge() {
+    fn test_plaintext_preset_is_rejected() {
         let mut config = Config::default();
         config.salt = "local1".to_owned();
         let hard_settings = HashMap::from([("password".to_owned(), "preset-password".to_owned())]);
 
         with_config_and_hard_settings(config, hard_settings, || {
-            assert_eq!(Config::get_effective_permanent_password_salt(), "local1");
-            assert!(Config::has_permanent_password());
-            assert!(Config::is_using_preset_password());
+            assert_eq!(Config::get_effective_permanent_password_salt(), "");
+            assert!(!Config::has_permanent_password());
+            assert!(!Config::is_using_preset_password());
         });
     }
 
@@ -3507,26 +3533,21 @@ mod tests {
     #[test]
     fn test_validation_rejects_general_encrypted_permanent_password() {
         let mut cfg = Config::default();
-        cfg.password =
-            encrypt_str_or_original("noncurrent-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        cfg.password = encrypt_str("noncurrent-secret", ENCRYPT_MAX_LEN).unwrap();
         cfg.salt = "salt123".to_owned();
         assert!(Config::validate_permanent_password_storage(&cfg).is_err());
     }
 
     #[test]
     fn test_validation_rejects_corrupted_general_encrypted_permanent_password_storage() {
-        let encrypted_storage =
-            encrypt_str_or_original("noncurrent-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        let mut invalid_payload = base64::decode(
-            &encrypted_storage.as_bytes()[PASSWORD_ENC_VERSION.len()..],
-            base64::Variant::Original,
-        )
-        .unwrap();
+        let encrypted_storage = encrypt_str("noncurrent-secret", ENCRYPT_MAX_LEN).unwrap();
+        let mut invalid_payload = BASE64
+            .decode(&encrypted_storage.as_bytes()[SECRET_STORAGE_VERSION.len()..])
+            .unwrap();
         *invalid_payload.last_mut().unwrap() ^= 1;
 
         let mut cfg = Config::default();
-        cfg.password = PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
+        cfg.password = SECRET_STORAGE_VERSION.to_owned() + &BASE64.encode(invalid_payload);
         cfg.salt = "salt123".to_owned();
 
         assert!(Config::validate_permanent_password_storage(&cfg).is_err());
@@ -3547,10 +3568,8 @@ mod tests {
     #[test]
     fn test_set_sanitizes_invalid_permanent_password_storage_in_memory_and_on_disk() {
         let mut cfg = Config::default();
-        let invalid_payload =
-            crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
-        cfg.password = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
+        let invalid_payload = crate::password_security::encrypt_local(b"not-a-hash").unwrap();
+        cfg.password = PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(invalid_payload);
         cfg.salt = "salt123".to_owned();
         cfg.id = "123456789".to_owned();
 
@@ -3571,7 +3590,7 @@ mod tests {
     fn test_store_keeps_existing_enc_id_when_id_is_unchanged() {
         let mut cfg = Config::default();
         cfg.id = "123456789".to_owned();
-        cfg.enc_id = encrypt_str_or_original(&cfg.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        cfg.enc_id = encrypt_str(&cfg.id, ENCRYPT_MAX_LEN).unwrap();
         let original_enc_id = cfg.enc_id.clone();
 
         with_config_and_hard_settings(Config::default(), HashMap::new(), || {
@@ -3588,17 +3607,15 @@ mod tests {
         let updated_id = "987654321";
         let mut cfg = Config::default();
         cfg.id = updated_id.to_owned();
-        let original_enc_id =
-            encrypt_str_or_original(original_id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let original_enc_id = encrypt_str(original_id, ENCRYPT_MAX_LEN).unwrap();
         cfg.enc_id = original_enc_id.clone();
 
         with_config_and_hard_settings(Config::default(), HashMap::new(), || {
             assert!(Config::set(cfg));
 
             let stored = Config::load().enc_id;
-            let (stored_id, encrypted, _) = decrypt_str_or_original(&stored, PASSWORD_ENC_VERSION);
+            let stored_id = decrypt_str(&stored).unwrap();
             assert_ne!(stored, original_enc_id);
-            assert!(encrypted);
             assert_eq!(stored_id, updated_id);
             assert_eq!(Config::get().id, updated_id);
         });
@@ -3609,17 +3626,13 @@ mod tests {
         let _guard = lock_config_state_for_test();
         let _path_guard = ConfigPathTestGuard::new();
         let pin = "123456";
-        let original_unlock_pin =
-            encrypt_str_or_original(pin, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let original_unlock_pin = encrypt_str(pin, ENCRYPT_MAX_LEN).unwrap();
         let mut cfg = Config2 {
             unlock_pin: original_unlock_pin.clone(),
             ..Default::default()
         };
         Config::store_(&cfg, "2");
-        let (unlock_pin, decrypted, _) =
-            decrypt_str_or_original(&cfg.unlock_pin, PASSWORD_ENC_VERSION);
-        assert!(decrypted);
-        cfg.unlock_pin = unlock_pin;
+        cfg.unlock_pin = decrypt_str(&cfg.unlock_pin).unwrap();
         cfg.nat_type = 1;
 
         cfg.store();
@@ -3701,7 +3714,7 @@ mod tests {
     #[test]
     fn test_validation_rejects_current_prefixed_non_hash_payload() {
         let mut cfg = Config::default();
-        let plain = "01".to_owned() + &base64::encode([42u8; 24], base64::Variant::Original);
+        let plain = "01".to_owned() + &BASE64.encode([42u8; 24]);
         cfg.password = plain.clone();
         cfg.salt = "salt123".to_owned();
 
@@ -3744,15 +3757,15 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_rejects_non_current_storage_payloads() {
-        let invalid_payload = vec![42u8; sodiumoxide::crypto::secretbox::MACBYTES + 1];
-        let invalid_storage = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
+        let invalid_payload = vec![42u8; crate::crypto::secretbox::MACBYTES + 1];
+        let invalid_storage =
+            PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(invalid_payload);
         let encrypted_noncurrent_plaintext =
-            encrypt_str_or_original("noncurrent-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+            encrypt_str("noncurrent-secret", ENCRYPT_MAX_LEN).unwrap();
 
-        let encrypted = crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
-        let encrypted_non_hash = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(encrypted, base64::Variant::Original);
+        let encrypted = crate::password_security::encrypt_local(b"not-a-hash").unwrap();
+        let encrypted_non_hash =
+            PERMANENT_PASSWORD_ENC_VERSION.to_owned() + &BASE64.encode(encrypted);
         for storage in [
             "00secret",
             &encrypted_noncurrent_plaintext,
