@@ -477,7 +477,7 @@ message FileTransferSendConfirmRequest {
   sint32 file_num = 2;
   oneof union {
     bool skip = 3;
-    uint32 offset_blk = 4;
+    uint64 offset_bytes = 4;
   }
 }
 

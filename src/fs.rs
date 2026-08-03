@@ -1765,7 +1765,10 @@ impl TransferJob {
             if offset > file.metadata().await?.len() {
                 bail!("resume offset exceeds source file length");
             }
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let position = file.seek(std::io::SeekFrom::Start(offset)).await?;
+            if position != offset {
+                bail!("source resume seek returned the wrong position");
+            }
             self.data_stream = Some(DataStream::FileStream(file));
             self.transferred = resumed_transferred;
             self.finished_size = resumed_finished_size;
@@ -1784,7 +1787,11 @@ impl TransferJob {
             bail!("resume offset exceeds temporary file length");
         }
         let mut file = File::from_std(file);
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file.set_len(offset).await?;
+        let position = file.seek(std::io::SeekFrom::Start(offset)).await?;
+        if position != offset {
+            bail!("destination resume seek returned the wrong position");
+        }
         self.data_stream = Some(DataStream::FileStream(file));
         self.pending_write = Some(pending);
         self.transferred = resumed_transferred;
@@ -1819,13 +1826,11 @@ impl TransferJob {
                         self.set_file_confirmed(true);
                     }
                 }
-                Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)) => {
+                Some(file_transfer_send_confirm_request::Union::OffsetBytes(offset)) => {
                     self.set_file_confirmed(true);
                     // If offset is greater than 0, we need to seek to the offset
                     if offset > 0 {
-                        if let Err(err) = self
-                            .set_stream_offset(r.file_num as usize, offset as u64)
-                            .await
+                        if let Err(err) = self.set_stream_offset(r.file_num as usize, offset).await
                         {
                             log::warn!("Failed to resume file transfer: {err}");
                             self.record_terminal_error(&err);
@@ -2210,6 +2215,7 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
 mod tests {
     use super::*;
     use crate::compress::decompress;
+    use protobuf::Message as _;
 
     struct TestTempDir {
         path: PathBuf,
@@ -2603,7 +2609,7 @@ mod tests {
                 .confirm(&FileTransferSendConfirmRequest {
                     id: 110,
                     file_num: 0,
-                    union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(3)),
+                    union: Some(file_transfer_send_confirm_request::Union::OffsetBytes(3)),
                     ..Default::default()
                 })
                 .await,
@@ -3374,6 +3380,185 @@ mod tests {
 
         assert_eq!(std::fs::read(downloads.join("keep.bin")).unwrap(), b"old");
         assert_eq!(std::fs::read(downloads.join("write.bin")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn resume_confirmation_preserves_offsets_above_u32() {
+        let tmp_root = TestTempDir::new("camellia_large_resume_offset");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let transferred_size = u64::from(u32::MAX) + 2;
+        let declared_size = transferred_size + 1;
+        let modified = 1_700_000_003;
+        let temp_name = random_sidecar_name(DOWNLOAD_TEMP_PREFIX, DOWNLOAD_TEMP_SUFFIX);
+        let partial = std::fs::File::create(downloads.join(&temp_name))
+            .expect("create sparse partial transfer");
+        partial
+            .set_len(transferred_size)
+            .expect("set sparse partial length");
+        std::fs::write(
+            downloads.join("large.bin.digest"),
+            serde_json::to_vec(&FileDigest {
+                size: declared_size,
+                modified,
+                temp_name,
+            })
+            .expect("serialize transfer digest"),
+        )
+        .expect("write transfer digest");
+        let digest = transfer_digest(144, declared_size, modified);
+        let result =
+            is_write_need_confirmation(true, &get_string(&downloads.join("large.bin")), &digest)
+                .expect("inspect large resumable transfer");
+        let DigestCheckResult::NeedConfirm(confirmation) = result else {
+            panic!("large partial transfer must request confirmation");
+        };
+        assert_eq!(confirmation.transferred_size, transferred_size);
+
+        let request = FileTransferSendConfirmRequest {
+            id: confirmation.id,
+            file_num: confirmation.file_num,
+            union: Some(file_transfer_send_confirm_request::Union::OffsetBytes(
+                confirmation.transferred_size,
+            )),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            request.offset_bytes(),
+            confirmation.transferred_size,
+            "resume confirmation must not truncate the byte offset"
+        );
+    }
+
+    #[test]
+    fn resume_offset_wire_round_trips_four_gib_boundaries() {
+        let offsets = [
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            (1u64 << 32) + 1,
+            (8u64 << 30) + 17,
+        ];
+
+        for offset in offsets {
+            let request = FileTransferSendConfirmRequest {
+                id: 145,
+                file_num: 0,
+                union: Some(file_transfer_send_confirm_request::Union::OffsetBytes(
+                    offset,
+                )),
+                ..Default::default()
+            };
+            let encoded = request.write_to_bytes().expect("serialize resume request");
+            let decoded = FileTransferSendConfirmRequest::parse_from_bytes(&encoded)
+                .expect("parse resume request");
+
+            assert_eq!(decoded.offset_bytes(), offset);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_resume_truncates_sparse_suffix_and_writes_above_four_gib() {
+        let tmp_root = TestTempDir::new("camellia_sparse_receiver_resume");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let offset = (1u64 << 32) + 1;
+        let declared_size = offset + 1;
+        let modified = 1_700_000_004;
+        let temp_name = random_sidecar_name(DOWNLOAD_TEMP_PREFIX, DOWNLOAD_TEMP_SUFFIX);
+        let partial = std::fs::File::create(downloads.join(&temp_name))
+            .expect("create sparse receiver partial");
+        partial
+            .set_len(declared_size + 4096)
+            .expect("create stale sparse suffix");
+        std::fs::write(
+            downloads.join("large.bin.digest"),
+            serde_json::to_vec(&FileDigest {
+                size: declared_size,
+                modified,
+                temp_name: temp_name.clone(),
+            })
+            .expect("serialize receiver digest"),
+        )
+        .expect("write receiver digest");
+        let mut job = new_sized_write_job(146, downloads.clone(), &[("large.bin", declared_size)])
+            .expect("create large receiver job");
+        job.files[0].modified_time = modified;
+        job.set_digest(declared_size, modified);
+
+        job.set_stream_offset(0, offset)
+            .await
+            .expect("seek large receiver partial");
+        assert_eq!(
+            std::fs::metadata(downloads.join(&temp_name))
+                .expect("inspect truncated receiver partial")
+                .len(),
+            offset
+        );
+        job.write(sequenced_block(146, 0, 0, b"x", false))
+            .await
+            .expect("write byte above four GiB");
+        job.write(sequenced_block(146, 0, 1, b"", false))
+            .await
+            .expect("finish large receiver file");
+        job.modify_time().await.expect("commit large receiver file");
+
+        let final_path = downloads.join("large.bin");
+        assert_eq!(
+            std::fs::metadata(&final_path)
+                .expect("inspect large final file")
+                .len(),
+            declared_size
+        );
+        let mut final_file = std::fs::File::open(final_path).expect("open large final file");
+        std::io::Seek::seek(&mut final_file, std::io::SeekFrom::Start(offset))
+            .expect("seek final byte");
+        let mut last = [0u8; 1];
+        std::io::Read::read_exact(&mut final_file, &mut last).expect("read final byte");
+        assert_eq!(last, [b'x']);
+    }
+
+    #[tokio::test]
+    async fn sender_resume_reads_from_sparse_offset_above_eight_gib() {
+        let tmp_root = TestTempDir::new("camellia_sparse_sender_resume");
+        let source = tmp_root.join("source.bin");
+        std::fs::create_dir_all(&tmp_root.path).expect("create source directory");
+        let offset = (8u64 << 30) + 17;
+        let source_file = std::fs::File::create(&source).expect("create sparse source file");
+        source_file
+            .set_len(offset + 1)
+            .expect("set sparse source length");
+        let mut job = TransferJob::new_read(
+            147,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(source),
+            0,
+            false,
+            true,
+            false,
+        )
+        .expect("create sparse sender job");
+
+        job.set_stream_offset(0, offset)
+            .await
+            .expect("seek sparse sender source");
+        let data = job
+            .read()
+            .await
+            .expect("read sparse source")
+            .expect("read data block");
+        let eof = job
+            .read()
+            .await
+            .expect("read sparse source EOF")
+            .expect("read EOF block");
+
+        assert_eq!(data.blk_id, 0);
+        assert_eq!(data.data.as_ref(), &[0]);
+        assert_eq!(eof.blk_id, 1);
+        assert!(eof.data.is_empty());
+        assert_eq!(job.finished_size(), offset + 1);
     }
 
     #[cfg(windows)]
