@@ -262,6 +262,21 @@ pub fn can_enable_overwrite_detection(version: i64) -> bool {
     version >= get_version_number("1.1.10")
 }
 
+/// Current peer-to-peer file transfer contract.
+///
+/// This is deliberately an exact-match capability: the pre-production protocol does not carry a
+/// legacy compatibility mode for block ordering, terminal errors, or 64-bit resume offsets.
+pub const FILE_TRANSFER_PROTOCOL_VERSION: u32 = 2;
+
+pub fn validate_file_transfer_protocol_version(version: u32) -> ResultType<()> {
+    if version != FILE_TRANSFER_PROTOCOL_VERSION {
+        bail!(
+            "unsupported file transfer protocol version {version}; expected {FILE_TRANSFER_PROTOCOL_VERSION}"
+        );
+    }
+    Ok(())
+}
+
 #[repr(i32)]
 #[derive(Copy, Clone, Serialize, Debug, PartialEq, Default)]
 pub enum JobType {
@@ -2216,6 +2231,44 @@ mod tests {
     use super::*;
     use crate::compress::decompress;
     use protobuf::Message as _;
+
+    #[test]
+    fn file_transfer_protocol_version_requires_an_exact_match() {
+        assert!(validate_file_transfer_protocol_version(FILE_TRANSFER_PROTOCOL_VERSION).is_ok());
+        for unsupported in [0, 1, FILE_TRANSFER_PROTOCOL_VERSION + 1] {
+            assert!(validate_file_transfer_protocol_version(unsupported).is_err());
+        }
+
+        let login = LoginRequest {
+            file_transfer_protocol_version: FILE_TRANSFER_PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        let login = LoginRequest::parse_from_bytes(
+            &login
+                .write_to_bytes()
+                .expect("serialize login file transfer capability"),
+        )
+        .expect("parse login file transfer capability");
+        assert_eq!(
+            login.file_transfer_protocol_version,
+            FILE_TRANSFER_PROTOCOL_VERSION
+        );
+
+        let peer_info = PeerInfo {
+            file_transfer_protocol_version: FILE_TRANSFER_PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        let peer_info = PeerInfo::parse_from_bytes(
+            &peer_info
+                .write_to_bytes()
+                .expect("serialize peer file transfer capability"),
+        )
+        .expect("parse peer file transfer capability");
+        assert_eq!(
+            peer_info.file_transfer_protocol_version,
+            FILE_TRANSFER_PROTOCOL_VERSION
+        );
+    }
 
     struct TestTempDir {
         path: PathBuf,
