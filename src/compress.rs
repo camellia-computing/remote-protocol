@@ -14,28 +14,23 @@ thread_local! {
     static COMPRESSOR: RefCell<io::Result<Compressor<'static>>> = RefCell::new(Compressor::new(crate::config::COMPRESS_LEVEL));
 }
 
-pub fn compress(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+pub fn compress(data: &[u8]) -> io::Result<Vec<u8>> {
     COMPRESSOR.with(|c| {
-        if let Ok(mut c) = c.try_borrow_mut() {
-            match &mut *c {
-                Ok(c) => match c.compress(data) {
-                    Ok(res) => out = res,
-                    Err(err) => {
-                        crate::log::debug!("Failed to compress: {}", err);
-                    }
-                },
-                Err(err) => {
-                    crate::log::debug!("Failed to get compressor: {}", err);
-                }
-            }
+        let mut compressor = c.try_borrow_mut().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file compressor is already borrowed",
+            )
+        })?;
+        match &mut *compressor {
+            Ok(compressor) => compressor.compress(data),
+            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
         }
-    });
-    out
+    })
 }
 
-pub fn decompress(data: &[u8]) -> Vec<u8> {
-    decompress_with_limit(data, MAX_DECOMPRESSED_SIZE).unwrap_or_default()
+pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
+    decompress_with_limit(data, MAX_DECOMPRESSED_SIZE)
 }
 
 pub(crate) fn decompress_with_limit(data: &[u8], limit: usize) -> io::Result<Vec<u8>> {
@@ -71,5 +66,16 @@ mod tests {
             decompress_with_limit(&compressed, input.len()).unwrap(),
             input
         );
+    }
+
+    #[test]
+    fn compressor_contention_must_not_be_reported_as_empty_success() {
+        COMPRESSOR.with(|compressor| {
+            let _borrow = compressor.borrow_mut();
+            assert!(
+                compress(b"payload must not disappear").is_err(),
+                "compressor contention must not become a successful empty payload"
+            );
+        });
     }
 }

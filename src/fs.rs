@@ -359,6 +359,7 @@ struct PendingWrite {
     temp_name: String,
     digest_name: OsString,
     modified_time: u64,
+    renamed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -433,7 +434,7 @@ pub struct TransferJob {
     #[serde(skip_serializing)]
     pending_write: Option<PendingWrite>,
     #[serde(skip_serializing)]
-    write_error: Option<String>,
+    terminal_error: Option<String>,
     #[serde(skip_serializing)]
     is_read_job: bool,
     #[serde(skip_serializing)]
@@ -494,12 +495,34 @@ fn is_compressed_file(name: &str) -> bool {
     compressed_exts.contains(&ext)
 }
 
+fn compress_file_block_with<F>(data: Vec<u8>, compressor: F) -> (Vec<u8>, bool)
+where
+    F: FnOnce(&[u8]) -> std::io::Result<Vec<u8>>,
+{
+    match compressor(&data) {
+        Ok(compressed) if compressed.len() < data.len() => (compressed, true),
+        Ok(_) => (data, false),
+        Err(err) => {
+            log::warn!("failed to compress file block, sending it uncompressed: {err}");
+            (data, false)
+        }
+    }
+}
+
 fn checked_total_size(files: &[FileEntry]) -> ResultType<u64> {
     files.iter().try_fold(0u64, |total, file| {
         total
             .checked_add(file.size)
             .ok_or_else(|| anyhow!("declared file total size overflow"))
     })
+}
+
+fn validate_initial_file_num(file_num: i32, file_count: usize) -> ResultType<usize> {
+    let file_num = usize::try_from(file_num).map_err(|_| anyhow!("wrong initial file number"))?;
+    if file_num > file_count {
+        bail!("wrong initial file number");
+    }
+    Ok(file_num)
 }
 
 pub fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
@@ -857,6 +880,7 @@ fn prepare_new_write(
                 temp_name,
                 digest_name,
                 modified_time,
+                renamed: false,
             },
         ));
     }
@@ -890,6 +914,7 @@ fn open_resumed_write(
             temp_name: stored_digest.temp_name,
             digest_name,
             modified_time,
+            renamed: false,
         },
     ))
 }
@@ -949,6 +974,7 @@ impl TransferJob {
             }
             DataSource::MemoryCursor(c) => (Vec::new(), c.get_ref().len() as u64),
         };
+        validate_initial_file_num(file_num, files.len())?;
         Ok(Self {
             id,
             r#type,
@@ -983,6 +1009,7 @@ impl TransferJob {
     #[inline]
     pub fn set_files(&mut self, files: Vec<FileEntry>) -> ResultType<()> {
         validate_transfer_file_names(&files)?;
+        validate_initial_file_num(self.file_num, files.len())?;
         let total_size = checked_total_size(&files)?;
         if let DataSource::FilePath(base) = &self.data_source {
             for file in &files {
@@ -1026,46 +1053,129 @@ impl TransferJob {
         self.file_num
     }
 
+    fn ensure_not_terminated(&self) -> ResultType<()> {
+        if let Some(err) = self.terminal_error.as_deref() {
+            bail!("file transfer is terminated: {err}");
+        }
+        Ok(())
+    }
+
+    fn record_terminal_error(&mut self, err: &crate::anyhow::Error) {
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(err.to_string());
+        }
+    }
+
+    fn ensure_write_complete(&self) -> ResultType<()> {
+        if self.r#type == JobType::Printer
+            || matches!(self.data_source, DataSource::MemoryCursor(_))
+        {
+            return Ok(());
+        }
+        let file_num = usize::try_from(self.file_num).map_err(|_| anyhow!("wrong file number"))?;
+        if self.files.is_empty() || file_num == self.files.len() {
+            return Ok(());
+        }
+        if file_num > self.files.len() {
+            bail!("file transfer ended with an invalid file number");
+        }
+        let is_last_file = file_num
+            .checked_add(1)
+            .is_some_and(|next| next == self.files.len());
+        let current_file_complete = self.write_progress.file_num == self.file_num
+            && self.write_progress.bytes_written == self.files[file_num].size
+            && self.write_progress.eof_seen;
+        if !is_last_file || !current_file_complete {
+            bail!("file transfer ended before the declared files were complete");
+        }
+        Ok(())
+    }
+
     async fn finalize_pending_write(&mut self) -> ResultType<()> {
-        let Some(pending) = self.pending_write.take() else {
+        let Some(pending) = self.pending_write.as_ref() else {
             if let Some(DataStream::FileStream(file)) = self.data_stream.take() {
                 file.sync_all().await?;
             }
             return Ok(());
         };
+        let modified_time = i64::try_from(pending.modified_time)
+            .map_err(|_| anyhow!("file modification time is out of range"))?;
         let stream = self
             .data_stream
-            .take()
+            .as_mut()
             .ok_or_else(|| anyhow!("transfer file stream is missing"))?;
         let DataStream::FileStream(file) = stream else {
             bail!("transfer file stream has the wrong type");
         };
         file.sync_all().await?;
-        let file = file.into_std().await;
+        let file_for_metadata = file.try_clone().await?.into_std().await;
+
+        if !pending.renamed {
+            let parent = pending.parent.try_clone()?;
+            let final_name = pending.final_name.clone();
+            let temp_name = pending.temp_name.clone();
+            tokio::task::spawn_blocking(move || -> ResultType<()> {
+                ensure_safe_final_target(&parent, &final_name)?;
+                parent.rename(&temp_name, &parent, &final_name)?;
+                Ok(())
+            })
+            .await??;
+            self.pending_write
+                .as_mut()
+                .ok_or_else(|| anyhow!("transfer pending state disappeared"))?
+                .renamed = true;
+        }
+
+        let parent = self
+            .pending_write
+            .as_ref()
+            .ok_or_else(|| anyhow!("transfer pending state disappeared"))?
+            .parent
+            .try_clone()?;
+        tokio::task::spawn_blocking(move || parent.open(".")?.sync_all()).await??;
+
         tokio::task::spawn_blocking(move || -> ResultType<()> {
-            let modified_time = i64::try_from(pending.modified_time)
-                .map_err(|_| anyhow!("file modification time is out of range"))?;
             filetime::set_file_handle_times(
-                &file,
+                &file_for_metadata,
                 None,
                 Some(filetime::FileTime::from_unix_time(modified_time, 0)),
             )?;
-            ensure_safe_final_target(&pending.parent, &pending.final_name)?;
-            pending
-                .parent
-                .rename(&pending.temp_name, &pending.parent, &pending.final_name)?;
-            remove_file_or_symlink_if_present(&pending.parent, &pending.digest_name)?;
+            file_for_metadata.sync_all()?;
             Ok(())
         })
         .await??;
+
+        let pending = self
+            .pending_write
+            .as_ref()
+            .ok_or_else(|| anyhow!("transfer pending state disappeared"))?;
+        let parent = pending.parent.try_clone()?;
+        let digest_name = pending.digest_name.clone();
+        tokio::task::spawn_blocking(move || -> ResultType<()> {
+            remove_file_or_symlink_if_present(&parent, &digest_name)?;
+            parent.open(".")?.sync_all()?;
+            Ok(())
+        })
+        .await??;
+        self.pending_write.take();
+        self.data_stream.take();
         Ok(())
     }
 
     pub async fn modify_time(&mut self) -> ResultType<()> {
-        if self.r#type == JobType::Printer {
-            return Ok(());
+        self.ensure_not_terminated()?;
+        let result = async {
+            self.ensure_write_complete()?;
+            if self.r#type != JobType::Printer {
+                self.finalize_pending_write().await?;
+            }
+            Ok(())
         }
-        self.finalize_pending_write().await
+        .await;
+        if let Err(err) = &result {
+            self.record_terminal_error(err);
+        }
+        result
     }
 
     pub async fn remove_download_file(&mut self) -> ResultType<()> {
@@ -1123,11 +1233,17 @@ impl TransferJob {
     }
 
     pub async fn write(&mut self, block: FileTransferBlock) -> ResultType<()> {
+        self.ensure_not_terminated()?;
+        let result = self.write_block(block).await;
+        if let Err(err) = &result {
+            self.record_terminal_error(err);
+        }
+        result
+    }
+
+    async fn write_block(&mut self, block: FileTransferBlock) -> ResultType<()> {
         if block.id != self.id {
             bail!("Wrong id");
-        }
-        if let Some(err) = self.write_error.as_ref() {
-            bail!("cannot continue file transfer after resume failure: {err}");
         }
         if block.file_num < 0 {
             bail!("wrong file number");
@@ -1286,7 +1402,17 @@ impl TransferJob {
     /// Open the data stream for the current file.
     /// Returns Ok(true) if job is done, Ok(false) otherwise.
     async fn open_data_stream(&mut self) -> ResultType<bool> {
-        let file_num = self.file_num as usize;
+        self.ensure_not_terminated()?;
+        let result = self.open_data_stream_inner().await;
+        if let Err(err) = &result {
+            self.record_terminal_error(err);
+        }
+        result
+    }
+
+    async fn open_data_stream_inner(&mut self) -> ResultType<bool> {
+        let file_num =
+            usize::try_from(self.file_num).map_err(|_| anyhow!("wrong initial file number"))?;
         match &mut self.data_source {
             DataSource::FilePath(p) => {
                 if file_num >= self.files.len() {
@@ -1301,10 +1427,7 @@ impl TransferJob {
                             self.file_confirmed = false;
                             self.file_is_waiting = false;
                         }
-                        // On open error, behave the same as validation failure: advance
-                        // to next file and return the error.
                         Err(err) => {
-                            self.file_num += 1;
                             self.file_confirmed = false;
                             self.file_is_waiting = false;
                             return Err(err.into());
@@ -1337,6 +1460,15 @@ impl TransferJob {
     }
 
     async fn init_data_stream(&mut self, stream: &mut crate::Stream) -> ResultType<()> {
+        self.ensure_not_terminated()?;
+        let result = self.init_data_stream_inner(stream).await;
+        if let Err(err) = &result {
+            self.record_terminal_error(err);
+        }
+        result
+    }
+
+    async fn init_data_stream_inner(&mut self, stream: &mut crate::Stream) -> ResultType<()> {
         if self.open_data_stream().await? {
             return Ok(());
         }
@@ -1356,6 +1488,15 @@ impl TransferJob {
     /// so caller can send it via IPC instead of network stream.
     /// Returns Ok(None) if job is done or already initialized.
     pub async fn init_data_stream_for_cm(&mut self) -> ResultType<Option<(u64, u64)>> {
+        self.ensure_not_terminated()?;
+        let result = self.init_data_stream_for_cm_inner().await;
+        if let Err(err) = &result {
+            self.record_terminal_error(err);
+        }
+        result
+    }
+
+    async fn init_data_stream_for_cm_inner(&mut self) -> ResultType<Option<(u64, u64)>> {
         if self.open_data_stream().await? {
             return Ok(None);
         }
@@ -1373,6 +1514,15 @@ impl TransferJob {
     }
 
     pub async fn read(&mut self) -> ResultType<Option<FileTransferBlock>> {
+        self.ensure_not_terminated()?;
+        let result = self.read_block().await;
+        if let Err(err) = &result {
+            self.record_terminal_error(err);
+        }
+        result
+    }
+
+    async fn read_block(&mut self) -> ResultType<Option<FileTransferBlock>> {
         if self.r#type == JobType::Generic
             && self.enable_overwrite_detection
             && !self.file_confirmed()
@@ -1412,7 +1562,6 @@ impl TransferJob {
                 .await
             {
                 Err(err) => {
-                    self.file_num += 1;
                     self.data_stream = None;
                     self.file_confirmed = false;
                     self.file_is_waiting = false;
@@ -1448,11 +1597,7 @@ impl TransferJob {
                 .checked_add(offset)
                 .ok_or_else(|| anyhow!("finished file size overflow"))?;
             if matches!(self.data_source, DataSource::FilePath(_)) && !is_compressed_file(name) {
-                let tmp = compress(&buf);
-                if tmp.len() < buf.len() {
-                    buf = tmp;
-                    compressed = true;
-                }
+                (buf, compressed) = compress_file_block_with(buf, compress);
             }
             let wire_len =
                 u64::try_from(buf.len()).map_err(|_| anyhow!("wire block length overflow"))?;
@@ -1548,12 +1693,15 @@ impl TransferJob {
     /// 1. Files are not waiting for confirmation by peers.
     #[inline]
     pub fn job_completed(&self) -> bool {
-        // has no error, Condition 2
-        !self.enable_overwrite_detection || (!self.file_confirmed && !self.file_is_waiting)
+        self.terminal_error.is_none()
+            && (!self.enable_overwrite_detection || (!self.file_confirmed && !self.file_is_waiting))
     }
 
     /// Get job error message, useful for getting status when job had finished
     pub fn job_error(&self) -> Option<String> {
+        if let Some(err) = self.terminal_error.as_ref() {
+            return Some(err.clone());
+        }
         if self.job_skipped() {
             return Some("skipped".to_string());
         }
@@ -1561,12 +1709,27 @@ impl TransferJob {
     }
 
     pub fn set_file_skipped(&mut self) -> bool {
+        if self.terminal_error.is_some() {
+            return false;
+        }
+        if self.pending_write.is_some() {
+            self.terminal_error = Some("cannot skip a file after writing has started".to_string());
+            return false;
+        }
+        let Some(next_file_num) = self.file_num.checked_add(1) else {
+            self.terminal_error = Some("file number overflow while skipping".to_string());
+            return false;
+        };
         log::debug!("skip file {} in job {}", self.file_num, self.id);
         self.data_stream.take();
         self.set_file_confirmed(false);
         self.set_file_is_waiting(false);
-        self.file_num += 1;
-        self.next_read_block_id = 0;
+        self.file_num = next_file_num;
+        if self.is_read_job {
+            self.next_read_block_id = 0;
+        } else {
+            self.write_progress = WriteProgress::new(next_file_num);
+        }
         self.file_skipped = true;
         true
     }
@@ -1637,6 +1800,9 @@ impl TransferJob {
     }
 
     pub async fn confirm(&mut self, r: &FileTransferSendConfirmRequest) -> bool {
+        if self.ensure_not_terminated().is_err() {
+            return false;
+        }
         if self.file_num() != r.file_num {
             // This branch will always be hit if:
             // 1. `confirm()` is called in `ui_cm_interface.rs`
@@ -1647,7 +1813,6 @@ impl TransferJob {
         } else {
             match r.union {
                 Some(file_transfer_send_confirm_request::Union::Skip(s)) => {
-                    self.write_error = None;
                     if s {
                         self.set_file_skipped();
                     } else {
@@ -1656,7 +1821,6 @@ impl TransferJob {
                 }
                 Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)) => {
                     self.set_file_confirmed(true);
-                    self.write_error = None;
                     // If offset is greater than 0, we need to seek to the offset
                     if offset > 0 {
                         if let Err(err) = self
@@ -1664,7 +1828,7 @@ impl TransferJob {
                             .await
                         {
                             log::warn!("Failed to resume file transfer: {err}");
-                            self.write_error = Some(err.to_string());
+                            self.record_terminal_error(&err);
                             return false;
                         }
                     }
@@ -1810,27 +1974,37 @@ pub fn get_job_immutable(id: i32, jobs: &[TransferJob]) -> Option<&TransferJob> 
     jobs.iter().find(|x| x.id() == id)
 }
 
-async fn init_jobs(jobs: &mut [TransferJob], stream: &mut crate::Stream) -> ResultType<()> {
+async fn init_jobs(
+    jobs: &mut [TransferJob],
+    stream: &mut crate::Stream,
+) -> ResultType<Vec<(i32, String)>> {
+    let mut failed = Vec::new();
     for job in jobs.iter_mut() {
         if job.is_last_job {
             continue;
         }
         if let Err(err) = job.init_data_stream(stream).await {
+            job.record_terminal_error(&err);
+            let error = job.job_error().unwrap_or_else(|| err.to_string());
             stream
-                .send(&new_error(job.id(), err, job.file_num()))
+                .send(&new_error(job.id(), &error, job.file_num()))
                 .await?;
+            failed.push((job.id(), error));
         }
     }
-    Ok(())
+    Ok(failed)
 }
 
 pub async fn handle_read_jobs(
     jobs: &mut Vec<TransferJob>,
     stream: &mut crate::Stream,
 ) -> ResultType<String> {
-    init_jobs(jobs, stream).await?;
-
     let mut job_log = Default::default();
+    for (id, error) in init_jobs(jobs, stream).await? {
+        if let Some(job) = remove_job(id, jobs) {
+            job_log = serialize_transfer_job(&job, false, false, &error);
+        }
+    }
     let mut finished = Vec::new();
     for job in jobs.iter_mut() {
         if job.is_last_job {
@@ -1838,8 +2012,11 @@ pub async fn handle_read_jobs(
         }
         match job.read().await {
             Err(err) => {
+                let error = job.job_error().unwrap_or_else(|| err.to_string());
+                job_log = serialize_transfer_job(job, false, false, &error);
+                finished.push(job.id());
                 stream
-                    .send(&new_error(job.id(), err, job.file_num()))
+                    .send(&new_error(job.id(), error, job.file_num()))
                     .await?;
             }
             Ok(Some(block)) => {
@@ -2347,14 +2524,17 @@ mod tests {
         std::fs::create_dir_all(&downloads).expect("create downloads directory");
         std::fs::write(downloads.join("report.txt"), b"old contents")
             .expect("create old destination");
-        let mut job =
-            new_write_job(108, downloads.clone(), "report.txt").expect("create write job");
+        let mut job = new_sized_write_job(108, downloads.clone(), &[("report.txt", 11)])
+            .expect("create write job");
         job.files[0].modified_time = 1_700_000_000;
         job.set_digest(11, 1_700_000_000);
 
         job.write(transfer_block(108, 0, b"new payload"))
             .await
             .expect("write transfer payload");
+        job.write(sequenced_block(108, 0, 1, b"", false))
+            .await
+            .expect("finish transfer payload");
 
         assert_eq!(
             std::fs::read(downloads.join("report.txt")).expect("read pre-commit destination"),
@@ -2477,7 +2657,7 @@ mod tests {
             .expect("read resumed source")
             .expect("source must yield a block");
         let data = if block.compressed {
-            decompress(&block.data)
+            decompress(&block.data).expect("decompress sender block")
         } else {
             block.data.to_vec()
         };
@@ -2545,12 +2725,16 @@ mod tests {
             b"sentinel"
         );
 
-        let mut commit_job =
-            new_write_job(113, downloads.clone(), "commit.txt").expect("create commit job");
+        let mut commit_job = new_sized_write_job(113, downloads.clone(), &[("commit.txt", 8)])
+            .expect("create commit job");
         commit_job
             .write(transfer_block(113, 0, b"new data"))
             .await
             .expect("write commit candidate");
+        commit_job
+            .write(sequenced_block(113, 0, 1, b"", false))
+            .await
+            .expect("finish commit candidate");
         create_test_file_symlink(&sentinel, &downloads.join("commit.txt"))
             .expect("replace final target with symlink");
 
@@ -2575,12 +2759,15 @@ mod tests {
         std::fs::write(&sentinel, b"sentinel").expect("create sentinel");
         create_test_file_symlink(&sentinel, &downloads.join("report.txt.digest"))
             .expect("create digest symlink");
-        let mut job =
-            new_write_job(114, downloads.clone(), "report.txt").expect("create write job");
+        let mut job = new_sized_write_job(114, downloads.clone(), &[("report.txt", 7)])
+            .expect("create write job");
 
         job.write(transfer_block(114, 0, b"payload"))
             .await
             .expect("write through atomically replaced digest");
+        job.write(sequenced_block(114, 0, 1, b"", false))
+            .await
+            .expect("finish digest replacement transfer");
 
         assert_eq!(
             std::fs::read(&sentinel).expect("read digest sentinel"),
@@ -2812,44 +2999,65 @@ mod tests {
                 .is_err(),
             "duplicate block id must fail"
         );
+
+        let mut gap = new_sized_write_job(137, downloads.clone(), &[("gap.bin", 2)])
+            .expect("create block gap job");
+        gap.write(sequenced_block(137, 0, 0, b"a", false))
+            .await
+            .expect("write first gap block");
         assert!(
-            blocks
-                .write(sequenced_block(125, 0, 2, b"b", false))
+            gap.write(sequenced_block(137, 0, 2, b"b", false))
                 .await
                 .is_err(),
             "block id gaps must fail"
         );
+
+        let mut early_eof = new_sized_write_job(138, downloads.clone(), &[("early.bin", 2)])
+            .expect("create early EOF job");
+        early_eof
+            .write(sequenced_block(138, 0, 0, b"a", false))
+            .await
+            .expect("write partial early EOF data");
         assert!(
-            blocks
-                .write(sequenced_block(125, 0, 1, b"", false))
+            early_eof
+                .write(sequenced_block(138, 0, 1, b"", false))
                 .await
                 .is_err(),
             "EOF before the declared size must fail"
         );
-        blocks
-            .write(sequenced_block(125, 0, 1, b"b", false))
+
+        let mut past_size = new_sized_write_job(139, downloads.clone(), &[("past-size.bin", 1)])
+            .expect("create data-after-size job");
+        past_size
+            .write(sequenced_block(139, 0, 0, b"a", false))
             .await
-            .expect("rejected blocks must not consume sequence state");
+            .expect("fill data-after-size job");
         assert!(
-            blocks
-                .write(sequenced_block(125, 0, 2, b"c", false))
+            past_size
+                .write(sequenced_block(139, 0, 1, b"b", false))
                 .await
                 .is_err(),
             "data after the declared size must fail"
         );
-        blocks
-            .write(sequenced_block(125, 0, 2, b"", false))
+
+        let mut duplicate_eof =
+            new_sized_write_job(140, downloads.clone(), &[("duplicate-eof.bin", 1)])
+                .expect("create duplicate EOF job");
+        duplicate_eof
+            .write(sequenced_block(140, 0, 0, b"a", false))
             .await
-            .expect("write exact EOF");
+            .expect("fill duplicate EOF job");
+        duplicate_eof
+            .write(sequenced_block(140, 0, 1, b"", false))
+            .await
+            .expect("write first EOF");
         assert!(
-            blocks
-                .write(sequenced_block(125, 0, 3, b"", false))
+            duplicate_eof
+                .write(sequenced_block(140, 0, 2, b"", false))
                 .await
                 .is_err(),
             "duplicate EOF must fail"
         );
-        assert_eq!(blocks.finished_size(), 2);
-        assert_eq!(blocks.transferred(), 2);
 
         let mut files = new_sized_write_job(
             126,
@@ -2868,24 +3076,42 @@ mod tests {
                 .is_err(),
             "next file before EOF must fail"
         );
-        files
-            .write(sequenced_block(126, 0, 1, b"", false))
+
+        let mut backward = new_sized_write_job(
+            141,
+            downloads.clone(),
+            &[("backward-a.bin", 1), ("backward-b.bin", 1)],
+        )
+        .expect("create backward transition job");
+        backward
+            .write(sequenced_block(141, 0, 0, b"a", false))
+            .await
+            .expect("fill backward first file");
+        backward
+            .write(sequenced_block(141, 0, 1, b"", false))
             .await
             .expect("finish first file");
-        files
-            .write(sequenced_block(126, 1, 0, b"b", false))
+        backward
+            .write(sequenced_block(141, 1, 0, b"b", false))
             .await
             .expect("advance exactly one file");
         assert!(
-            files
-                .write(sequenced_block(126, 0, 2, b"", false))
+            backward
+                .write(sequenced_block(141, 0, 2, b"", false))
                 .await
                 .is_err(),
             "backward file numbers must fail"
         );
+
+        let mut skipped = new_sized_write_job(
+            142,
+            downloads.clone(),
+            &[("skipped-a.bin", 1), ("skipped-b.bin", 1)],
+        )
+        .expect("create skipped transition job");
         assert!(
-            files
-                .write(sequenced_block(126, 3, 0, b"", false))
+            skipped
+                .write(sequenced_block(142, 3, 0, b"", false))
                 .await
                 .is_err(),
             "skipped file numbers must fail"
@@ -2897,16 +3123,20 @@ mod tests {
         let tmp_root = TestTempDir::new("camellia_zero_size_file_sequence");
         let downloads = tmp_root.join("downloads");
         std::fs::create_dir_all(&downloads).expect("create downloads directory");
-        let mut job =
-            new_sized_write_job(127, downloads.clone(), &[("empty.bin", 0), ("one.bin", 1)])
-                .expect("create zero-size file job");
-
+        let mut rejected =
+            new_sized_write_job(143, downloads.clone(), &[("rejected-empty.bin", 0)])
+                .expect("create rejected zero-size file job");
         assert!(
-            job.write(sequenced_block(127, 0, 0, b"x", false))
+            rejected
+                .write(sequenced_block(143, 0, 0, b"x", false))
                 .await
                 .is_err(),
             "a zero-size file cannot accept data"
         );
+
+        let mut job =
+            new_sized_write_job(127, downloads.clone(), &[("empty.bin", 0), ("one.bin", 1)])
+                .expect("create zero-size file job");
         job.write(sequenced_block(127, 0, 0, b"", false))
             .await
             .expect("empty file must accept its explicit EOF");
@@ -3001,6 +3231,149 @@ mod tests {
             .expect("read downloads directory")
             .next()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn write_error_is_terminal_and_cannot_be_retried() {
+        let tmp_root = TestTempDir::new("camellia_terminal_write_error");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job = new_sized_write_job(132, downloads.clone(), &[("report.bin", 4)])
+            .expect("create write job");
+
+        let first = job
+            .write(sequenced_block(132, 0, 0, b"not-zstd", true))
+            .await
+            .expect_err("malformed compressed block must fail")
+            .to_string();
+        let repeated = job
+            .write(sequenced_block(132, 0, 0, b"four", false))
+            .await
+            .expect_err("a later valid block must not clear the first terminal error");
+        assert_eq!(job.job_error().as_deref(), Some(first.as_str()));
+        assert!(repeated.to_string().contains(&first));
+        assert!(std::fs::read_dir(&downloads)
+            .expect("read downloads directory")
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_write_cannot_be_finalized_as_success() {
+        let tmp_root = TestTempDir::new("camellia_incomplete_write_done");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job = new_sized_write_job(133, downloads.clone(), &[("report.bin", 4)])
+            .expect("create write job");
+        job.write(sequenced_block(133, 0, 0, b"fo", false))
+            .await
+            .expect("write partial block");
+
+        assert!(
+            job.modify_time().await.is_err(),
+            "Done before exact size and EOF must fail"
+        );
+        assert!(job.job_error().is_some());
+        assert!(!downloads.join("report.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_error_is_sticky_and_keeps_resume_ownership() {
+        let tmp_root = TestTempDir::new("camellia_sticky_finalize_error");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job = new_sized_write_job(134, downloads.clone(), &[("report.bin", 4)])
+            .expect("create write job");
+        job.files[0].modified_time = u64::MAX;
+        job.write(sequenced_block(134, 0, 0, b"four", false))
+            .await
+            .expect("write complete data");
+        job.write(sequenced_block(134, 0, 1, b"", false))
+            .await
+            .expect("write EOF");
+        let digest = stored_digest(&downloads, "report.bin");
+
+        let first = job
+            .modify_time()
+            .await
+            .expect_err("out-of-range mtime must fail finalization")
+            .to_string();
+        assert!(
+            job.modify_time().await.is_err(),
+            "a repeated Done must preserve the first finalization error"
+        );
+        assert_eq!(job.job_error().as_deref(), Some(first.as_str()));
+        assert!(downloads.join(&digest.temp_name).is_file());
+        assert!(downloads.join("report.bin.digest").is_file());
+        assert!(!downloads.join("report.bin").exists());
+        job.remove_download_file()
+            .await
+            .expect("terminal job must retain cleanup ownership");
+        assert!(!downloads.join(&digest.temp_name).exists());
+        assert!(!downloads.join("report.bin.digest").exists());
+    }
+
+    #[tokio::test]
+    async fn sender_open_error_cannot_advance_into_completed_state() {
+        let tmp_root = TestTempDir::new("camellia_terminal_sender_open_error");
+        let source = tmp_root.join("source.bin");
+        std::fs::create_dir_all(&tmp_root.path).expect("create source directory");
+        std::fs::write(&source, b"payload").expect("create source file");
+        let mut job = TransferJob::new_read(
+            135,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(source.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .expect("create sender job");
+        std::fs::remove_file(source).expect("remove source before open");
+
+        assert!(job.init_data_stream_for_cm().await.is_err());
+        assert!(
+            job.init_data_stream_for_cm().await.is_err(),
+            "the first open error must remain terminal"
+        );
+        assert!(job.job_error().is_some());
+        assert!(!job.job_completed());
+        assert_eq!(job.file_num(), 0);
+    }
+
+    #[test]
+    fn sender_compression_failure_falls_back_to_original_block() {
+        let original = b"payload must remain intact".to_vec();
+        let (data, compressed) = compress_file_block_with(original.clone(), |_| {
+            Err(std::io::Error::other("injected compressor failure"))
+        });
+
+        assert_eq!(data, original);
+        assert!(!compressed);
+    }
+
+    #[tokio::test]
+    async fn receiver_skip_advances_sequence_without_overwriting_existing_file() {
+        let tmp_root = TestTempDir::new("camellia_receiver_skip_sequence");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        std::fs::write(downloads.join("keep.bin"), b"old").expect("create skipped destination");
+        let mut job =
+            new_sized_write_job(136, downloads.clone(), &[("keep.bin", 1), ("write.bin", 1)])
+                .expect("create receiver job");
+
+        assert!(job.set_file_skipped());
+        job.write(sequenced_block(136, 1, 0, b"x", false))
+            .await
+            .expect("write file after skipped destination");
+        job.write(sequenced_block(136, 1, 1, b"", false))
+            .await
+            .expect("finish file after skipped destination");
+        job.modify_time().await.expect("commit file after skip");
+
+        assert_eq!(std::fs::read(downloads.join("keep.bin")).unwrap(), b"old");
+        assert_eq!(std::fs::read(downloads.join("write.bin")).unwrap(), b"x");
     }
 
     #[cfg(windows)]
