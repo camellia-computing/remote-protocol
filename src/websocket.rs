@@ -197,6 +197,12 @@ impl WsFramedStream {
         Ok(())
     }
 
+    async fn close_after_protocol_error(&mut self) {
+        if let Err(err) = self.stream.close(None).await {
+            log::debug!("Failed to close WebSocket after protocol error: {err}");
+        }
+    }
+
     #[inline]
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
         while let Some(msg) = self.stream.next().await {
@@ -216,12 +222,20 @@ impl WsFramedStream {
                     let mut bytes = BytesMut::from(&data[..]);
                     if let Some(key) = self.encrypt.as_mut() {
                         if let Err(err) = key.dec(&mut bytes) {
+                            self.close_after_protocol_error().await;
                             return Some(Err(err));
                         }
                     }
                     return Some(Ok(bytes));
                 }
                 WsMessage::Text(text) => {
+                    if self.encrypt.is_some() {
+                        self.close_after_protocol_error().await;
+                        return Some(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "encrypted WebSocket received an unauthenticated text frame",
+                        )));
+                    }
                     let bytes = BytesMut::from(text.as_bytes());
                     return Some(Ok(bytes));
                 }
@@ -330,6 +344,7 @@ mod tests {
         keys, Config, EXE_RENDEZVOUS_SERVER, PROD_RENDEZVOUS_SERVER, RENDEZVOUS_SERVERS,
     };
     use std::sync::Mutex;
+    use tokio::net::TcpListener;
 
     static WEBSOCKET_CONFIG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -363,6 +378,110 @@ mod tests {
             *PROD_RENDEZVOUS_SERVER.write().unwrap() = self.prod_rendezvous_server.clone();
             *EXE_RENDEZVOUS_SERVER.write().unwrap() = self.exe_rendezvous_server.clone();
         }
+    }
+
+    fn test_key() -> Key {
+        Key([0x5a; crate::crypto::secretbox::KEYBYTES])
+    }
+
+    async fn websocket_pair() -> (WsFramedStream, WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener must bind");
+        let addr = listener.local_addr().expect("listener address must exist");
+        let client = TcpStream::connect(addr)
+            .await
+            .expect("test client must connect");
+        let (server, _) = listener.accept().await.expect("test server must accept");
+        let client = WsFramedStream::from_tcp_stream(client, addr)
+            .await
+            .expect("client websocket must initialize");
+        let server =
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(server), Role::Server, None)
+                .await;
+        (client, server)
+    }
+
+    async fn assert_peer_received_close(peer: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        let message = timeout(Duration::from_secs(1), peer.next())
+            .await
+            .expect("close frame must arrive before timeout")
+            .expect("websocket stream must yield close")
+            .expect("close frame must be valid");
+        assert!(matches!(message, WsMessage::Close(_)));
+    }
+
+    #[tokio::test]
+    async fn unencrypted_websocket_accepts_text_during_handshake() {
+        let (mut receiver, mut sender) = websocket_pair().await;
+        sender
+            .send(WsMessage::Text("handshake".into()))
+            .await
+            .expect("text frame must send");
+
+        let bytes = receiver
+            .next()
+            .await
+            .expect("stream must yield text")
+            .expect("unencrypted text must be accepted");
+        assert_eq!(&bytes[..], b"handshake");
+    }
+
+    #[tokio::test]
+    async fn secured_websocket_rejects_text_and_closes() {
+        let (mut receiver, mut sender) = websocket_pair().await;
+        receiver.set_key(test_key());
+        sender
+            .send(WsMessage::Text("unauthenticated".into()))
+            .await
+            .expect("text frame must send");
+
+        let error = receiver
+            .next()
+            .await
+            .expect("stream must yield protocol error")
+            .expect_err("secured text must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_peer_received_close(&mut sender).await;
+    }
+
+    #[tokio::test]
+    async fn secured_websocket_rejects_short_binary_and_closes() {
+        let (mut receiver, mut sender) = websocket_pair().await;
+        receiver.set_key(test_key());
+        sender
+            .send(WsMessage::Binary(vec![0x41].into()))
+            .await
+            .expect("binary frame must send");
+
+        let error = receiver
+            .next()
+            .await
+            .expect("stream must yield authentication error")
+            .expect_err("short encrypted frame must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_peer_received_close(&mut sender).await;
+    }
+
+    #[tokio::test]
+    async fn secured_websocket_accepts_authenticated_binary() {
+        let (mut receiver, mut sender) = websocket_pair().await;
+        let mut encryptor = Encrypt::new(test_key());
+        let ciphertext = encryptor
+            .enc(b"authenticated")
+            .expect("payload must encrypt");
+        receiver.set_key(test_key());
+        sender
+            .send(WsMessage::Binary(ciphertext.into()))
+            .await
+            .expect("binary frame must send");
+
+        let bytes = receiver
+            .next()
+            .await
+            .expect("stream must yield binary")
+            .expect("authenticated binary must decrypt");
+        assert_eq!(&bytes[..], b"authenticated");
     }
 
     #[test]

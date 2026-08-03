@@ -298,18 +298,28 @@ impl Encrypt {
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
-        if bytes.len() <= 1 {
-            return Ok(());
+        if bytes.len() < secretbox::MACBYTES {
+            return Err(Error::new(
+                io::ErrorKind::InvalidData,
+                "encrypted frame is shorter than its authentication tag",
+            ));
         }
-        self.2 += 1;
-        let nonce = FramedStream::get_nonce(self.2);
+        let seqnum = self
+            .2
+            .checked_add(1)
+            .ok_or_else(|| Error::new(io::ErrorKind::InvalidData, "receive sequence exhausted"))?;
+        let nonce = FramedStream::get_nonce(seqnum);
         match secretbox::open(bytes, &nonce, &self.0) {
             Ok(res) => {
+                self.2 = seqnum;
                 bytes.clear();
                 bytes.put_slice(&res);
                 Ok(())
             }
-            Err(_) => Err(Error::other("decryption error")),
+            Err(_) => Err(Error::new(
+                io::ErrorKind::InvalidData,
+                "decryption authentication failed",
+            )),
         }
     }
 
@@ -339,5 +349,63 @@ impl Encrypt {
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key);
         Ok(Key(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> Key {
+        Key([0x5a; secretbox::KEYBYTES])
+    }
+
+    #[test]
+    fn decryption_rejects_unauthenticated_frames_without_advancing_sequence() {
+        for len in 0..=secretbox::MACBYTES {
+            let mut decryptor = Encrypt::new(test_key());
+            let mut frame = BytesMut::from(vec![0x41; len].as_slice());
+
+            assert!(decryptor.dec(&mut frame).is_err(), "length {len}");
+            assert_eq!(decryptor.2, 0, "length {len}");
+        }
+    }
+
+    #[test]
+    fn decryption_accepts_authenticated_empty_plaintext_at_mac_boundary() {
+        let mut encryptor = Encrypt::new(test_key());
+        let mut decryptor = Encrypt::new(test_key());
+        let ciphertext = encryptor.enc(&[]).expect("empty plaintext must encrypt");
+        assert_eq!(ciphertext.len(), secretbox::MACBYTES);
+
+        let mut frame = BytesMut::from(ciphertext.as_slice());
+        decryptor
+            .dec(&mut frame)
+            .expect("authenticated empty plaintext must decrypt");
+
+        assert!(frame.is_empty());
+        assert_eq!(decryptor.2, 1);
+    }
+
+    #[test]
+    fn failed_authentication_does_not_consume_the_expected_nonce() {
+        let mut encryptor = Encrypt::new(test_key());
+        let ciphertext = encryptor
+            .enc(b"authenticated payload")
+            .expect("payload must encrypt");
+        let mut tampered = ciphertext.clone();
+        tampered[0] ^= 0x80;
+
+        let mut decryptor = Encrypt::new(test_key());
+        let mut tampered_frame = BytesMut::from(tampered.as_slice());
+        assert!(decryptor.dec(&mut tampered_frame).is_err());
+        assert_eq!(decryptor.2, 0);
+
+        let mut valid_frame = BytesMut::from(ciphertext.as_slice());
+        decryptor
+            .dec(&mut valid_frame)
+            .expect("the expected nonce must remain available after rejection");
+        assert_eq!(&valid_frame[..], b"authenticated payload");
+        assert_eq!(decryptor.2, 1);
     }
 }
