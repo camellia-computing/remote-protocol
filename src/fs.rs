@@ -416,6 +416,8 @@ pub struct TransferJob {
     pending_write: Option<PendingWrite>,
     #[serde(skip_serializing)]
     write_error: Option<String>,
+    #[serde(skip_serializing)]
+    is_read_job: bool,
     pub total_size: u64,
     finished_size: u64,
     transferred: u64,
@@ -927,6 +929,7 @@ impl TransferJob {
             files,
             total_size,
             enable_overwrite_detection,
+            is_read_job: true,
             ..Default::default()
         })
     }
@@ -1430,6 +1433,18 @@ impl TransferJob {
             }
             DataSource::MemoryCursor(_) => bail!("memory transfers cannot be resumed"),
         };
+        if self.is_read_job {
+            let path = Self::join(&base, &entry.name);
+            let mut file = File::open(&path).await?;
+            if offset > file.metadata().await?.len() {
+                bail!("resume offset exceeds source file length");
+            }
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            self.data_stream = Some(DataStream::FileStream(file));
+            self.transferred += offset;
+            self.finished_size += offset;
+            return Ok(());
+        }
         let digest = self.digest.clone();
         let name = entry.name;
         let modified_time = entry.modified_time;
@@ -2212,6 +2227,42 @@ mod tests {
         );
         assert!(!downloads.join(&first_digest.temp_name).exists());
         assert!(!downloads.join("report.txt.digest").exists());
+    }
+
+    #[tokio::test]
+    async fn sender_resume_seeks_the_source_file_instead_of_receiver_staging() {
+        let tmp_root = TestTempDir::new("camellia_sender_resume");
+        let source = tmp_root.join("source.txt");
+        std::fs::create_dir_all(&tmp_root.path).expect("create source directory");
+        std::fs::write(&source, b"abcdef").expect("create source file");
+        let mut job = TransferJob::new_read(
+            116,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(source),
+            0,
+            false,
+            true,
+            false,
+        )
+        .expect("create sending job");
+
+        job.set_stream_offset(0, 3)
+            .await
+            .expect("seek sending source");
+        let block = job
+            .read()
+            .await
+            .expect("read resumed source")
+            .expect("source must yield a block");
+        let data = if block.compressed {
+            decompress(&block.data)
+        } else {
+            block.data.to_vec()
+        };
+
+        assert_eq!(data, b"def");
+        assert_eq!(job.finished_size(), 6);
     }
 
     #[tokio::test]
