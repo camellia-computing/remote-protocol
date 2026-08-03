@@ -44,6 +44,8 @@ backtrace = "0.3"
 libc = "0.2"
 toml = "0.7"
 uuid = { version = "1.16", features = ["v4"] }
+cap-std = "3.4.5"
+cap-fs-ext = "3.4.5"
 # new sysinfo issue: https://github.com/rustdesk/rustdesk/pull/6330#issuecomment-2270871442
 sysinfo = { git = "https://github.com/rustdesk-org/sysinfo", rev = "90b1705d909a4902dbbbdea37ee64db17841077d" }
 thiserror = "1.0"

@@ -1,17 +1,23 @@
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 use std::{
+    ffi::{OsStr, OsString},
     fmt::{Debug, Display},
-    io::Cursor,
+    io::{Cursor, Read as _, Write as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicI32, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
+};
 use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream as TokioBufStream},
 };
 
@@ -345,6 +351,15 @@ enum DataStream {
     BufStream(TokioBufStream<Cursor<Vec<u8>>>),
 }
 
+#[derive(Debug)]
+struct PendingWrite {
+    parent: Dir,
+    final_name: OsString,
+    temp_name: String,
+    digest_name: OsString,
+    modified_time: u64,
+}
+
 impl Debug for DataStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -371,10 +386,12 @@ impl DataStream {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, Debug)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct FileDigest {
     pub size: u64,
     pub modified: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub temp_name: String,
 }
 
 #[derive(Default, Serialize, Debug)]
@@ -395,6 +412,10 @@ pub struct TransferJob {
 
     #[serde(skip_serializing)]
     data_stream: Option<DataStream>,
+    #[serde(skip_serializing)]
+    pending_write: Option<PendingWrite>,
+    #[serde(skip_serializing)]
+    write_error: Option<String>,
     pub total_size: u64,
     finished_size: u64,
     transferred: u64,
@@ -552,6 +573,295 @@ pub fn join_validated_path(base: &Path, name: &str) -> ResultType<PathBuf> {
     Ok(TransferJob::join(base, name))
 }
 
+const DOWNLOAD_TEMP_PREFIX: &str = ".camellia-download-";
+const DOWNLOAD_TEMP_SUFFIX: &str = ".part";
+const DIGEST_TEMP_PREFIX: &str = ".camellia-digest-";
+const DIGEST_TEMP_SUFFIX: &str = ".tmp";
+const MAX_DIGEST_BYTES: u64 = 4096;
+const RANDOM_NAME_ATTEMPTS: usize = 16;
+
+fn append_suffix(name: &OsStr, suffix: &str) -> OsString {
+    let mut result = name.to_os_string();
+    result.push(suffix);
+    result
+}
+
+fn random_sidecar_name(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}{}{suffix}", uuid::Uuid::new_v4())
+}
+
+fn validate_download_temp_name(name: &str) -> ResultType<()> {
+    let Some(uuid) = name
+        .strip_prefix(DOWNLOAD_TEMP_PREFIX)
+        .and_then(|name| name.strip_suffix(DOWNLOAD_TEMP_SUFFIX))
+    else {
+        bail!("invalid transfer temporary file name");
+    };
+    if uuid.len() != 36 || uuid::Uuid::parse_str(uuid)?.hyphenated().to_string() != uuid {
+        bail!("invalid transfer temporary file name");
+    }
+    Ok(())
+}
+
+fn nofollow_read_options() -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    options
+}
+
+fn nofollow_write_options(create_new: bool) -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options
+        .write(true)
+        .create_new(create_new)
+        .follow(FollowSymlinks::No);
+    options
+}
+
+fn open_ambient_directory_nofollow(path: &Path, create: bool) -> ResultType<Dir> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut root = PathBuf::new();
+    let mut components = Vec::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                root.push(std::path::MAIN_SEPARATOR.to_string());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if components.pop().is_none() {
+                    bail!("directory path escapes its filesystem root");
+                }
+            }
+            std::path::Component::Normal(component) => components.push(component.to_os_string()),
+        }
+    }
+    if root.as_os_str().is_empty() {
+        bail!("directory path has no filesystem root");
+    }
+    let mut directory = Dir::open_ambient_dir(root, ambient_authority())?;
+    for component in components {
+        directory = match directory.open_dir_nofollow(&component) {
+            Ok(next) => next,
+            Err(err) if create && err.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(&component) {
+                    Ok(()) => {}
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_err) => return Err(create_err.into()),
+                }
+                directory.open_dir_nofollow(&component)?
+            }
+            Err(err) => return Err(err.into()),
+        };
+    }
+    Ok(directory)
+}
+
+fn open_destination_parent(
+    base: &Path,
+    name: &str,
+    create_directories: bool,
+) -> ResultType<(Dir, OsString)> {
+    validate_file_name_no_traversal(name)?;
+    if name.is_empty() {
+        let final_name = base
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("destination file name is empty"))?
+            .to_os_string();
+        let parent = base.parent().filter(|path| !path.as_os_str().is_empty());
+        let parent = parent.unwrap_or_else(|| Path::new("."));
+        return Ok((
+            open_ambient_directory_nofollow(parent, create_directories)?,
+            final_name,
+        ));
+    }
+
+    let mut parent = open_ambient_directory_nofollow(base, create_directories)?;
+    let components = Path::new(name)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(component) => Some(Ok(component.to_os_string())),
+            std::path::Component::CurDir => None,
+            _ => Some(Err(anyhow!("invalid file name component"))),
+        })
+        .collect::<ResultType<Vec<_>>>()?;
+    let (final_name, parent_components) = components
+        .split_last()
+        .ok_or_else(|| anyhow!("destination file name is empty"))?;
+
+    for component in parent_components {
+        parent = match parent.open_dir_nofollow(component) {
+            Ok(directory) => directory,
+            Err(err) if create_directories && err.kind() == std::io::ErrorKind::NotFound => {
+                match parent.create_dir(component) {
+                    Ok(()) => {}
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_err) => return Err(create_err.into()),
+                }
+                parent.open_dir_nofollow(component)?
+            }
+            Err(err) => return Err(err.into()),
+        };
+    }
+    Ok((parent, final_name.clone()))
+}
+
+fn read_digest(parent: &Dir, digest_name: &OsStr) -> ResultType<Option<FileDigest>> {
+    let file = match parent.open_with(digest_name, &nofollow_read_options()) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_DIGEST_BYTES {
+        bail!("invalid transfer digest file");
+    }
+    let mut content = String::new();
+    file.into_std()
+        .take(MAX_DIGEST_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_DIGEST_BYTES {
+        bail!("transfer digest file is too large");
+    }
+    Ok(Some(serde_json::from_str(&content)?))
+}
+
+fn write_digest_atomically(
+    parent: &Dir,
+    digest_name: &OsStr,
+    digest: &FileDigest,
+) -> ResultType<()> {
+    let content = serde_json::to_vec(digest)?;
+    if content.len() as u64 > MAX_DIGEST_BYTES {
+        bail!("transfer digest file is too large");
+    }
+    for _ in 0..RANDOM_NAME_ATTEMPTS {
+        let temp_name = random_sidecar_name(DIGEST_TEMP_PREFIX, DIGEST_TEMP_SUFFIX);
+        let file = match parent.open_with(&temp_name, &nofollow_write_options(true)) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let mut file = file.into_std();
+        let result = (|| -> ResultType<()> {
+            file.write_all(&content)?;
+            file.sync_all()?;
+            parent.rename(&temp_name, parent, digest_name)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = parent.remove_file_or_symlink(&temp_name);
+        }
+        return result;
+    }
+    bail!("failed to allocate a unique transfer digest name")
+}
+
+fn remove_file_or_symlink_if_present(parent: &Dir, name: &OsStr) -> ResultType<()> {
+    match parent.remove_file_or_symlink(name) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn ensure_safe_final_target(parent: &Dir, final_name: &OsStr) -> ResultType<()> {
+    match parent.symlink_metadata(final_name) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("destination file is a symbolic link")
+        }
+        Ok(metadata) if !metadata.is_file() => bail!("destination is not a regular file"),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn prepare_new_write(
+    base: &Path,
+    name: &str,
+    digest: &FileDigest,
+    modified_time: u64,
+) -> ResultType<(std::fs::File, PendingWrite)> {
+    let (parent, final_name) = open_destination_parent(base, name, true)?;
+    ensure_safe_final_target(&parent, &final_name)?;
+    let digest_name = append_suffix(&final_name, ".digest");
+    let legacy_download_name = append_suffix(&final_name, ".download");
+
+    if let Ok(Some(previous_digest)) = read_digest(&parent, &digest_name) {
+        if validate_download_temp_name(&previous_digest.temp_name).is_ok() {
+            remove_file_or_symlink_if_present(&parent, OsStr::new(&previous_digest.temp_name))?;
+        }
+    }
+    remove_file_or_symlink_if_present(&parent, &legacy_download_name)?;
+
+    for _ in 0..RANDOM_NAME_ATTEMPTS {
+        let temp_name = random_sidecar_name(DOWNLOAD_TEMP_PREFIX, DOWNLOAD_TEMP_SUFFIX);
+        let file = match parent.open_with(&temp_name, &nofollow_write_options(true)) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let digest = FileDigest {
+            size: digest.size,
+            modified: digest.modified,
+            temp_name: temp_name.clone(),
+        };
+        if let Err(err) = write_digest_atomically(&parent, &digest_name, &digest) {
+            let _ = parent.remove_file_or_symlink(&temp_name);
+            return Err(err);
+        }
+        return Ok((
+            file.into_std(),
+            PendingWrite {
+                parent,
+                final_name,
+                temp_name,
+                digest_name,
+                modified_time,
+            },
+        ));
+    }
+    bail!("failed to allocate a unique transfer temporary file name")
+}
+
+fn open_resumed_write(
+    base: &Path,
+    name: &str,
+    digest: &FileDigest,
+    modified_time: u64,
+) -> ResultType<(std::fs::File, PendingWrite)> {
+    let (parent, final_name) = open_destination_parent(base, name, false)?;
+    ensure_safe_final_target(&parent, &final_name)?;
+    let digest_name = append_suffix(&final_name, ".digest");
+    let stored_digest = read_digest(&parent, &digest_name)?
+        .ok_or_else(|| anyhow!("transfer digest file is missing"))?;
+    if stored_digest.size != digest.size || stored_digest.modified != digest.modified {
+        bail!("transfer digest changed before resume");
+    }
+    validate_download_temp_name(&stored_digest.temp_name)?;
+    let file = parent.open_with(&stored_digest.temp_name, &nofollow_write_options(false))?;
+    if !file.metadata()?.is_file() {
+        bail!("transfer temporary path is not a regular file");
+    }
+    Ok((
+        file.into_std(),
+        PendingWrite {
+            parent,
+            final_name,
+            temp_name: stored_digest.temp_name,
+            digest_name,
+            modified_time,
+        },
+    ))
+}
+
 impl TransferJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new_write(
@@ -680,61 +990,87 @@ impl TransferJob {
         self.file_num
     }
 
-    fn resolve_entry_path(&self, base: &Path, name: &str) -> Option<PathBuf> {
-        if self.r#type == JobType::Generic {
-            match join_validated_path(base, name) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    log::error!("Invalid file name in transfer job {}: {}", self.id, err);
-                    None
+    async fn finalize_pending_write(&mut self) -> ResultType<()> {
+        let Some(pending) = self.pending_write.take() else {
+            if let Some(DataStream::FileStream(file)) = self.data_stream.take() {
+                file.sync_all().await?;
+            }
+            return Ok(());
+        };
+        let stream = self
+            .data_stream
+            .take()
+            .ok_or_else(|| anyhow!("transfer file stream is missing"))?;
+        let DataStream::FileStream(file) = stream else {
+            bail!("transfer file stream has the wrong type");
+        };
+        file.sync_all().await?;
+        let file = file.into_std().await;
+        tokio::task::spawn_blocking(move || -> ResultType<()> {
+            let modified_time = i64::try_from(pending.modified_time)
+                .map_err(|_| anyhow!("file modification time is out of range"))?;
+            filetime::set_file_handle_times(
+                &file,
+                None,
+                Some(filetime::FileTime::from_unix_time(modified_time, 0)),
+            )?;
+            ensure_safe_final_target(&pending.parent, &pending.final_name)?;
+            pending
+                .parent
+                .rename(&pending.temp_name, &pending.parent, &pending.final_name)?;
+            remove_file_or_symlink_if_present(&pending.parent, &pending.digest_name)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub async fn modify_time(&mut self) -> ResultType<()> {
+        if self.r#type == JobType::Printer {
+            return Ok(());
+        }
+        self.finalize_pending_write().await
+    }
+
+    pub async fn remove_download_file(&mut self) -> ResultType<()> {
+        if self.r#type == JobType::Printer {
+            return Ok(());
+        }
+        self.data_stream.take();
+        if let Some(pending) = self.pending_write.take() {
+            tokio::task::spawn_blocking(move || -> ResultType<()> {
+                remove_file_or_symlink_if_present(&pending.parent, OsStr::new(&pending.temp_name))?;
+                remove_file_or_symlink_if_present(&pending.parent, &pending.digest_name)?;
+                Ok(())
+            })
+            .await??;
+            return Ok(());
+        }
+
+        let (base, name) = match &self.data_source {
+            DataSource::FilePath(base) => {
+                let file_num = self.file_num as usize;
+                let Some(entry) = self.files.get(file_num) else {
+                    return Ok(());
+                };
+                (base.clone(), entry.name.clone())
+            }
+            DataSource::MemoryCursor(_) => return Ok(()),
+        };
+        tokio::task::spawn_blocking(move || -> ResultType<()> {
+            let (parent, final_name) = open_destination_parent(&base, &name, false)?;
+            let digest_name = append_suffix(&final_name, ".digest");
+            if let Ok(Some(digest)) = read_digest(&parent, &digest_name) {
+                if validate_download_temp_name(&digest.temp_name).is_ok() {
+                    remove_file_or_symlink_if_present(&parent, OsStr::new(&digest.temp_name))?;
                 }
             }
-        } else {
-            Some(Self::join(base, name))
-        }
-    }
-
-    pub fn modify_time(&self) {
-        if self.r#type == JobType::Printer {
-            return;
-        }
-        if let DataSource::FilePath(p) = &self.data_source {
-            let file_num = self.file_num as usize;
-            if file_num < self.files.len() {
-                let entry = &self.files[file_num];
-                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                    return;
-                };
-                let download_path = format!("{}.download", get_string(&path));
-                let digest_path = format!("{}.digest", get_string(&path));
-                std::fs::remove_file(digest_path).ok();
-                std::fs::rename(download_path, &path).ok();
-                filetime::set_file_mtime(
-                    &path,
-                    filetime::FileTime::from_unix_time(entry.modified_time as _, 0),
-                )
-                .ok();
-            }
-        }
-    }
-
-    pub fn remove_download_file(&self) {
-        if self.r#type == JobType::Printer {
-            return;
-        }
-        if let DataSource::FilePath(p) = &self.data_source {
-            let file_num = self.file_num as usize;
-            if file_num < self.files.len() {
-                let entry = &self.files[file_num];
-                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                    return;
-                };
-                let download_path = format!("{}.download", get_string(&path));
-                let digest_path = format!("{}.digest", get_string(&path));
-                std::fs::remove_file(download_path).ok();
-                std::fs::remove_file(digest_path).ok();
-            }
-        }
+            remove_file_or_symlink_if_present(&parent, &digest_name)?;
+            remove_file_or_symlink_if_present(&parent, &append_suffix(&final_name, ".download"))?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     #[inline]
@@ -754,51 +1090,38 @@ impl TransferJob {
         if block.id != self.id {
             bail!("Wrong id");
         }
-        match &self.data_source {
-            DataSource::FilePath(p) => {
-                let file_num = block.file_num as usize;
-                if file_num >= self.files.len() {
-                    bail!("Wrong file number");
-                }
-                if file_num != self.file_num as usize || self.data_stream.is_none() {
-                    self.modify_time();
-                    if let Some(DataStream::FileStream(file)) = self.data_stream.as_mut() {
-                        file.sync_all().await?;
-                    }
-                    self.file_num = block.file_num;
-                    let entry = &self.files[file_num];
-                    let (path, digest_path) = if self.r#type == JobType::Printer {
-                        (p.to_string_lossy().to_string(), None)
-                    } else {
-                        let path = join_validated_path(p, &entry.name)?;
-                        // NOTE: We intentionally keep path-based validation + regular file open here.
-                        // This still has a known TOCTOU window for symlink races, but avoids a large
-                        // cross-platform rewrite for now.
-                        // Revisit with descriptor/handle-based no-follow open in future hardening.
-                        if let Some(pp) = path.parent() {
-                            std::fs::create_dir_all(pp).ok();
-                        }
-                        let file_path = get_string(&path);
-                        (
-                            format!("{}.download", file_path),
-                            Some(format!("{}.digest", file_path)),
-                        )
-                    };
-                    if let Some(dp) = digest_path.as_ref() {
-                        if Path::new(dp).exists() {
-                            std::fs::remove_file(dp)?;
-                        }
-                    }
-                    self.data_stream = Some(DataStream::FileStream(File::create(&path).await?));
-                    if let Some(dp) = digest_path.as_ref() {
-                        std::fs::write(dp, json!(self.digest).to_string()).ok();
-                    }
-                }
+        if let Some(err) = self.write_error.as_ref() {
+            bail!("cannot continue file transfer after resume failure: {err}");
+        }
+        let file_num = block.file_num as usize;
+        if matches!(self.data_source, DataSource::FilePath(_)) && file_num >= self.files.len() {
+            bail!("Wrong file number");
+        }
+        let should_open = matches!(self.data_source, DataSource::FilePath(_))
+            && (file_num != self.file_num as usize || self.data_stream.is_none());
+        if should_open {
+            self.finalize_pending_write().await?;
+            self.file_num = block.file_num;
+            let (base, entry) = match &self.data_source {
+                DataSource::FilePath(base) => (base.clone(), self.files[file_num].clone()),
+                DataSource::MemoryCursor(_) => bail!("file transfer source changed unexpectedly"),
+            };
+            if self.r#type == JobType::Printer {
+                self.data_stream = Some(DataStream::FileStream(File::create(base).await?));
+            } else {
+                let digest = self.digest.clone();
+                let name = entry.name;
+                let modified_time = entry.modified_time;
+                let (file, pending) = tokio::task::spawn_blocking(move || {
+                    prepare_new_write(&base, &name, &digest, modified_time)
+                })
+                .await??;
+                self.data_stream = Some(DataStream::FileStream(File::from_std(file)));
+                self.pending_write = Some(pending);
             }
-            DataSource::MemoryCursor(c) => {
-                if self.data_stream.is_none() {
-                    self.data_stream = Some(DataStream::BufStream(TokioBufStream::new(c.clone())));
-                }
+        } else if let DataSource::MemoryCursor(cursor) = &self.data_source {
+            if self.data_stream.is_none() {
+                self.data_stream = Some(DataStream::BufStream(TokioBufStream::new(cursor.clone())));
             }
         }
         if block.compressed {
@@ -1096,56 +1419,35 @@ impl TransferJob {
         true
     }
 
-    async fn set_stream_offset(&mut self, file_num: usize, offset: u64) {
-        if let DataSource::FilePath(p) = &self.data_source {
-            let entry = &self.files[file_num];
-            let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                return;
-            };
-            let file_path = get_string(&path);
-            let download_path = format!("{}.download", file_path);
-            let digest_path = format!("{}.digest", file_path);
-
-            let mut f = if Path::new(&download_path).exists() && Path::new(&digest_path).exists() {
-                // If both download and digest files exist, seek (writer) to the offset
-                // NOTE: same as write path: best-effort symlink validation happened earlier,
-                // but this reopen remains TOCTOU-prone by design for now.
-                match OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(&download_path)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("Failed to open file {}: {}", download_path, e);
-                        return;
-                    }
-                }
-            } else if Path::new(&file_path).exists() {
-                // If `file_path` exists, seek (reader) to the offset
-                match File::open(&file_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("Failed to open file {}: {}", file_path, e);
-                        return;
-                    }
-                }
-            } else {
-                log::warn!(
-                    "File {} not found, cannot seek to offset {}",
-                    file_path,
-                    offset
-                );
-                return;
-            };
-            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
-                self.data_stream = Some(DataStream::FileStream(f));
-                self.transferred += offset;
-                self.finished_size += offset;
+    async fn set_stream_offset(&mut self, file_num: usize, offset: u64) -> ResultType<()> {
+        let (base, entry) = match &self.data_source {
+            DataSource::FilePath(base) => {
+                let entry = self
+                    .files
+                    .get(file_num)
+                    .ok_or_else(|| anyhow!("wrong file number for resume"))?;
+                (base.clone(), entry.clone())
             }
+            DataSource::MemoryCursor(_) => bail!("memory transfers cannot be resumed"),
+        };
+        let digest = self.digest.clone();
+        let name = entry.name;
+        let modified_time = entry.modified_time;
+        let (file, pending) = tokio::task::spawn_blocking(move || {
+            open_resumed_write(&base, &name, &digest, modified_time)
+        })
+        .await??;
+        let file_len = file.metadata()?.len();
+        if offset > file_len {
+            bail!("resume offset exceeds temporary file length");
         }
+        let mut file = File::from_std(file);
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        self.data_stream = Some(DataStream::FileStream(file));
+        self.pending_write = Some(pending);
+        self.transferred += offset;
+        self.finished_size += offset;
+        Ok(())
     }
 
     pub async fn confirm(&mut self, r: &FileTransferSendConfirmRequest) -> bool {
@@ -1159,6 +1461,7 @@ impl TransferJob {
         } else {
             match r.union {
                 Some(file_transfer_send_confirm_request::Union::Skip(s)) => {
+                    self.write_error = None;
                     if s {
                         self.set_file_skipped();
                     } else {
@@ -1167,10 +1470,17 @@ impl TransferJob {
                 }
                 Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)) => {
                     self.set_file_confirmed(true);
+                    self.write_error = None;
                     // If offset is greater than 0, we need to seek to the offset
                     if offset > 0 {
-                        self.set_stream_offset(r.file_num as usize, offset as u64)
-                            .await;
+                        if let Err(err) = self
+                            .set_stream_offset(r.file_num as usize, offset as u64)
+                            .await
+                        {
+                            log::warn!("Failed to resume file transfer: {err}");
+                            self.write_error = Some(err.to_string());
+                            return false;
+                        }
                     }
                 }
                 _ => {}
@@ -1446,61 +1756,73 @@ pub fn is_write_need_confirmation(
     file_path: &str,
     digest: &FileTransferDigest,
 ) -> ResultType<DigestCheckResult> {
-    let path = Path::new(file_path);
-    let digest_file = format!("{}.digest", file_path);
-    let download_file = format!("{}.download", file_path);
-    if is_resume && Path::new(&digest_file).exists() && Path::new(&download_file).exists() {
-        // If the digest file exists, it means the file was transferred before.
-        // We can use the digest file to check whether the file is the same.
-        if let Ok(content) = std::fs::read_to_string(digest_file) {
-            if let Ok(local_digest) = serde_json::from_str::<FileDigest>(&content) {
-                let is_identical = local_digest.modified == digest.last_modified
-                    && local_digest.size == digest.file_size;
-                if is_identical {
-                    if let Ok(download_metadata) = std::fs::metadata(download_file) {
-                        // Get the file size of the local file
-                        // Only send confirmation if the file is not empty.
-                        let transferred_size = download_metadata.len();
-                        if transferred_size > 0 {
-                            return Ok(DigestCheckResult::NeedConfirm(FileTransferDigest {
-                                id: digest.id,
-                                file_num: digest.file_num,
-                                last_modified: digest.last_modified,
-                                file_size: digest.file_size,
-                                is_identical,
-                                transferred_size,
-                                ..Default::default()
-                            }));
-                        }
-                    }
+    let (parent, final_name) = match open_destination_parent(Path::new(file_path), "", false) {
+        Ok(location) => location,
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(DigestCheckResult::NoSuchFile);
+        }
+        Err(err) => return Err(err),
+    };
+    if is_resume {
+        let digest_name = append_suffix(&final_name, ".digest");
+        if let Some(local_digest) = read_digest(&parent, &digest_name)? {
+            let is_identical = local_digest.modified == digest.last_modified
+                && local_digest.size == digest.file_size;
+            if is_identical {
+                validate_download_temp_name(&local_digest.temp_name)?;
+                let download =
+                    parent.open_with(&local_digest.temp_name, &nofollow_read_options())?;
+                let download_metadata = download.metadata()?;
+                if !download_metadata.is_file() {
+                    bail!("transfer temporary path is not a regular file");
+                }
+                let transferred_size = download_metadata.len();
+                if transferred_size > 0 {
+                    return Ok(DigestCheckResult::NeedConfirm(FileTransferDigest {
+                        id: digest.id,
+                        file_num: digest.file_num,
+                        last_modified: digest.last_modified,
+                        file_size: digest.file_size,
+                        is_identical,
+                        transferred_size,
+                        ..Default::default()
+                    }));
                 }
             }
         }
     }
 
-    if path.exists() && path.is_file() {
-        let metadata = std::fs::metadata(path)?;
-        let modified_time = metadata.modified()?;
-        let remote_mt = Duration::from_secs(digest.last_modified);
-        let local_mt = modified_time.duration_since(UNIX_EPOCH)?;
-        // [Note]
-        // We decide to give the decision whether to override the existing file to users,
-        // which obey the behavior of the file manager in our system.
-        let mut is_identical = false;
-        if remote_mt == local_mt && digest.file_size == metadata.len() {
-            is_identical = true;
+    match parent.symlink_metadata(&final_name) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("destination file is a symbolic link")
         }
-        Ok(DigestCheckResult::NeedConfirm(FileTransferDigest {
-            id: digest.id,
-            file_num: digest.file_num,
-            last_modified: local_mt.as_secs(),
-            file_size: metadata.len(),
-            is_identical,
-            ..Default::default()
-        }))
-    } else {
-        // If the file does not exist, or the digest file and download file do not exist, we return NoSuchFile.
-        Ok(DigestCheckResult::NoSuchFile)
+        Ok(metadata) if metadata.is_file() => {
+            let modified_time = metadata.modified()?;
+            let remote_mt = Duration::from_secs(digest.last_modified);
+            let local_mt = modified_time.into_std().duration_since(UNIX_EPOCH)?;
+            // [Note]
+            // We decide to give the decision whether to override the existing file to users,
+            // which obey the behavior of the file manager in our system.
+            let mut is_identical = false;
+            if remote_mt == local_mt && digest.file_size == metadata.len() {
+                is_identical = true;
+            }
+            Ok(DigestCheckResult::NeedConfirm(FileTransferDigest {
+                id: digest.id,
+                file_num: digest.file_num,
+                last_modified: local_mt.as_secs(),
+                file_size: metadata.len(),
+                is_identical,
+                ..Default::default()
+            }))
+        }
+        Ok(_) => Ok(DigestCheckResult::NoSuchFile),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DigestCheckResult::NoSuchFile),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1589,6 +1911,51 @@ mod tests {
         Ok(job)
     }
 
+    fn transfer_block(id: i32, file_num: i32, data: &[u8]) -> FileTransferBlock {
+        FileTransferBlock {
+            id,
+            file_num,
+            data: data.to_vec().into(),
+            ..Default::default()
+        }
+    }
+
+    fn transfer_digest(id: i32, file_size: u64, last_modified: u64) -> FileTransferDigest {
+        FileTransferDigest {
+            id,
+            file_num: 0,
+            file_size,
+            last_modified,
+            ..Default::default()
+        }
+    }
+
+    fn stored_digest(downloads: &Path, name: &str) -> FileDigest {
+        let content = std::fs::read_to_string(downloads.join(format!("{name}.digest")))
+            .expect("read stored transfer digest");
+        serde_json::from_str(&content).expect("parse stored transfer digest")
+    }
+
+    #[cfg(unix)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_test_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_test_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
     fn assert_err_contains(err: anyhow::Error, expected: &str) {
         assert!(
             err.to_string().contains(expected),
@@ -1649,6 +2016,309 @@ mod tests {
             .expect_err("symlink traversal must be rejected");
         assert_err_contains(err, "symlink");
         assert!(!escaped_target.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Windows symbolic-link privilege")]
+    #[tokio::test]
+    async fn write_does_not_follow_preexisting_download_symlink() {
+        let tmp_root = TestTempDir::new("camellia_download_symlink");
+        let downloads = tmp_root.join("downloads");
+        let sentinel = tmp_root.join("sentinel.txt");
+        std::fs::create_dir_all(downloads.join("report.txt"))
+            .expect("create destination directory which prevents legacy finalize");
+        std::fs::write(&sentinel, b"sentinel must remain unchanged")
+            .expect("create external sentinel");
+        create_test_file_symlink(&sentinel, &downloads.join("report.txt.download"))
+            .expect("create malicious download symlink");
+
+        let mut job = new_write_job(106, downloads, "report.txt").expect("create write job");
+        let result = job
+            .write(FileTransferBlock {
+                id: 106,
+                file_num: 0,
+                data: b"attacker-controlled payload".to_vec().into(),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read external sentinel"),
+            b"sentinel must remain unchanged"
+        );
+        assert!(result.is_err(), "a directory destination must be rejected");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Windows symbolic-link privilege")]
+    #[tokio::test]
+    async fn write_rejects_parent_symlink_added_after_file_list_validation() {
+        let tmp_root = TestTempDir::new("camellia_parent_symlink_swap");
+        let downloads = tmp_root.join("downloads");
+        let outside = tmp_root.join("outside");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let mut job =
+            new_write_job(107, downloads.clone(), "nested/report.txt").expect("create write job");
+        create_test_dir_symlink(&outside, &downloads.join("nested"))
+            .expect("swap parent for a symlink");
+
+        let result = job.write(transfer_block(107, 0, b"payload")).await;
+
+        assert!(
+            result.is_err(),
+            "a symlink parent must be rejected at open time"
+        );
+        assert!(!outside.join("report.txt").exists());
+        assert!(std::fs::read_dir(&outside)
+            .expect("read outside directory")
+            .next()
+            .is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Windows symbolic-link privilege")]
+    #[tokio::test]
+    async fn write_rejects_destination_root_swapped_for_symlink() {
+        let tmp_root = TestTempDir::new("camellia_destination_root_swap");
+        let downloads = tmp_root.join("downloads");
+        let original_downloads = tmp_root.join("original-downloads");
+        let outside = tmp_root.join("outside");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let mut job =
+            new_write_job(115, downloads.clone(), "report.txt").expect("create write job");
+        std::fs::rename(&downloads, &original_downloads).expect("move authorized directory");
+        create_test_dir_symlink(&outside, &downloads)
+            .expect("replace destination root with symlink");
+
+        let result = job.write(transfer_block(115, 0, b"payload")).await;
+
+        assert!(
+            result.is_err(),
+            "a replaced destination root must be rejected at open time"
+        );
+        assert!(std::fs::read_dir(&outside)
+            .expect("read outside directory")
+            .next()
+            .is_none());
+        assert!(std::fs::read_dir(&original_downloads)
+            .expect("read original destination directory")
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn write_uses_unique_same_directory_temp_and_commits_atomically() {
+        let tmp_root = TestTempDir::new("camellia_atomic_commit");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        std::fs::write(downloads.join("report.txt"), b"old contents")
+            .expect("create old destination");
+        let mut job =
+            new_write_job(108, downloads.clone(), "report.txt").expect("create write job");
+        job.files[0].modified_time = 1_700_000_000;
+        job.set_digest(11, 1_700_000_000);
+
+        job.write(transfer_block(108, 0, b"new payload"))
+            .await
+            .expect("write transfer payload");
+
+        assert_eq!(
+            std::fs::read(downloads.join("report.txt")).expect("read pre-commit destination"),
+            b"old contents"
+        );
+        assert!(!downloads.join("report.txt.download").exists());
+        let digest = stored_digest(&downloads, "report.txt");
+        validate_download_temp_name(&digest.temp_name).expect("validate random temp name");
+        assert!(downloads.join(&digest.temp_name).is_file());
+
+        job.modify_time().await.expect("commit transfer");
+
+        assert_eq!(
+            std::fs::read(downloads.join("report.txt")).expect("read committed destination"),
+            b"new payload"
+        );
+        assert!(!downloads.join(&digest.temp_name).exists());
+        assert!(!downloads.join("report.txt.digest").exists());
+    }
+
+    #[tokio::test]
+    async fn resume_reopens_only_recorded_regular_temp_without_truncation() {
+        let tmp_root = TestTempDir::new("camellia_secure_resume");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let modified = 1_700_000_001;
+        let mut first =
+            new_write_job(109, downloads.clone(), "report.txt").expect("create first job");
+        first.files[0].modified_time = modified;
+        first.set_digest(6, modified);
+        first
+            .write(transfer_block(109, 0, b"abc"))
+            .await
+            .expect("write first transfer segment");
+        if let Some(DataStream::FileStream(file)) = first.data_stream.as_mut() {
+            file.sync_all()
+                .await
+                .expect("settle partial transfer bytes");
+        }
+        let first_digest = stored_digest(&downloads, "report.txt");
+        drop(first);
+        assert_eq!(first_digest.size, 6);
+        assert_eq!(first_digest.modified, modified);
+        assert_eq!(
+            std::fs::metadata(downloads.join(&first_digest.temp_name))
+                .expect("inspect partial transfer")
+                .len(),
+            3
+        );
+
+        let digest = transfer_digest(110, 6, modified);
+        let confirmation =
+            is_write_need_confirmation(true, &get_string(&downloads.join("report.txt")), &digest)
+                .expect("inspect resumable transfer");
+        let DigestCheckResult::NeedConfirm(confirmation) = confirmation else {
+            panic!("regular partial transfer must request resume confirmation");
+        };
+        assert_eq!(confirmation.transferred_size, 3);
+
+        let mut resumed =
+            new_write_job(110, downloads.clone(), "report.txt").expect("create resumed job");
+        resumed.files[0].modified_time = modified;
+        resumed.set_digest(6, modified);
+        assert!(
+            resumed
+                .confirm(&FileTransferSendConfirmRequest {
+                    id: 110,
+                    file_num: 0,
+                    union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(3)),
+                    ..Default::default()
+                })
+                .await,
+            "resume open must succeed"
+        );
+        resumed
+            .write(transfer_block(110, 0, b"def"))
+            .await
+            .expect("append resumed segment");
+        resumed
+            .modify_time()
+            .await
+            .expect("commit resumed transfer");
+
+        assert_eq!(
+            std::fs::read(downloads.join("report.txt")).expect("read resumed destination"),
+            b"abcdef"
+        );
+        assert!(!downloads.join(&first_digest.temp_name).exists());
+        assert!(!downloads.join("report.txt.digest").exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_only_owned_temp_and_digest() {
+        let tmp_root = TestTempDir::new("camellia_secure_cancel");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job =
+            new_write_job(111, downloads.clone(), "report.txt").expect("create write job");
+        job.write(transfer_block(111, 0, b"partial"))
+            .await
+            .expect("write partial transfer");
+        let digest = stored_digest(&downloads, "report.txt");
+
+        job.remove_download_file()
+            .await
+            .expect("cancel transfer artifacts");
+
+        assert!(!downloads.join(&digest.temp_name).exists());
+        assert!(!downloads.join("report.txt.digest").exists());
+        assert!(!downloads.join("report.txt").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Windows symbolic-link privilege")]
+    #[tokio::test]
+    async fn resume_and_final_commit_reject_symlink_replacements() {
+        let tmp_root = TestTempDir::new("camellia_resume_symlink_swap");
+        let downloads = tmp_root.join("downloads");
+        let sentinel = tmp_root.join("sentinel.txt");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        std::fs::write(&sentinel, b"sentinel").expect("create sentinel");
+        let modified = 1_700_000_002;
+        let malicious_temp = random_sidecar_name(DOWNLOAD_TEMP_PREFIX, DOWNLOAD_TEMP_SUFFIX);
+        std::fs::write(
+            downloads.join("resume.txt.digest"),
+            serde_json::to_vec(&FileDigest {
+                size: 8,
+                modified,
+                temp_name: malicious_temp.clone(),
+            })
+            .expect("serialize malicious digest"),
+        )
+        .expect("write malicious digest");
+        create_test_file_symlink(&sentinel, &downloads.join(&malicious_temp))
+            .expect("replace resume temp with symlink");
+        let mut resume_job =
+            new_write_job(112, downloads.clone(), "resume.txt").expect("create resume job");
+        resume_job.files[0].modified_time = modified;
+        resume_job.set_digest(8, modified);
+
+        assert!(
+            resume_job.set_stream_offset(0, 1).await.is_err(),
+            "resume must reject a symlink temp"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel after resume rejection"),
+            b"sentinel"
+        );
+
+        let mut commit_job =
+            new_write_job(113, downloads.clone(), "commit.txt").expect("create commit job");
+        commit_job
+            .write(transfer_block(113, 0, b"new data"))
+            .await
+            .expect("write commit candidate");
+        create_test_file_symlink(&sentinel, &downloads.join("commit.txt"))
+            .expect("replace final target with symlink");
+
+        assert!(
+            commit_job.modify_time().await.is_err(),
+            "commit must reject a symlink destination"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel after commit rejection"),
+            b"sentinel"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Windows symbolic-link privilege")]
+    #[tokio::test]
+    async fn digest_symlink_is_replaced_without_following_it() {
+        let tmp_root = TestTempDir::new("camellia_digest_symlink");
+        let downloads = tmp_root.join("downloads");
+        let sentinel = tmp_root.join("sentinel.txt");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        std::fs::write(&sentinel, b"sentinel").expect("create sentinel");
+        create_test_file_symlink(&sentinel, &downloads.join("report.txt.digest"))
+            .expect("create digest symlink");
+        let mut job =
+            new_write_job(114, downloads.clone(), "report.txt").expect("create write job");
+
+        job.write(transfer_block(114, 0, b"payload"))
+            .await
+            .expect("write through atomically replaced digest");
+
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read digest sentinel"),
+            b"sentinel"
+        );
+        assert!(
+            std::fs::symlink_metadata(downloads.join("report.txt.digest"))
+                .expect("inspect replaced digest")
+                .is_file()
+        );
+        job.modify_time().await.expect("commit transfer");
     }
 
     #[test]
