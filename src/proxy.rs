@@ -393,7 +393,7 @@ impl Proxy {
                     super::timeout(self.ms_timeout, self.http_connect(stream, &target_addr))
                         .await??;
                 Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
                     addr,
                     None,
                     0,
@@ -420,7 +420,7 @@ impl Proxy {
                     }
                 };
                 Ok(FramedStream(
-                    Framed::new(stream, BytesCodec::new()),
+                    Framed::new(stream, BytesCodec::for_session()),
                     addr,
                     None,
                     0,
@@ -447,7 +447,7 @@ impl Proxy {
                     .await??
                 };
                 Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
                     addr,
                     None,
                     0,

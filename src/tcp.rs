@@ -143,7 +143,7 @@ impl FramedStream {
                     stream.set_nodelay(true).ok();
                     let addr = stream.local_addr()?;
                     return Ok(Self(
-                        Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                        Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
                         addr,
                         None,
                         0,
@@ -176,8 +176,23 @@ impl FramedStream {
     }
 
     pub fn from(stream: impl TcpStreamTrait + Send + Sync + 'static, addr: SocketAddr) -> Self {
+        Self::from_with_max_packet_length(
+            stream,
+            addr,
+            crate::bytes_codec::SESSION_MAX_PACKET_LENGTH,
+        )
+    }
+
+    pub fn from_with_max_packet_length(
+        stream: impl TcpStreamTrait + Send + Sync + 'static,
+        addr: SocketAddr,
+        max_packet_length: usize,
+    ) -> Self {
         Self(
-            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+            Framed::new(
+                DynTcpStream(Box::new(stream)),
+                BytesCodec::with_max_packet_length(max_packet_length),
+            ),
             addr,
             None,
             0,
