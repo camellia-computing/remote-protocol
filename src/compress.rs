@@ -4,7 +4,7 @@ use std::{
 };
 use zstd::bulk::Compressor;
 
-const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
 
 // The library supports regular compression levels from 1 up to ZSTD_maxCLevel(),
 // which is currently 22. Levels >= 20
@@ -38,7 +38,7 @@ pub fn decompress(data: &[u8]) -> Vec<u8> {
     decompress_with_limit(data, MAX_DECOMPRESSED_SIZE).unwrap_or_default()
 }
 
-fn decompress_with_limit(data: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn decompress_with_limit(data: &[u8], limit: usize) -> io::Result<Vec<u8>> {
     let decoder = zstd::Decoder::new(data)?;
     let mut output = Vec::new();
     decoder

@@ -1,6 +1,7 @@
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 use std::{
+    borrow::Cow,
     ffi::{OsStr, OsString},
     fmt::{Debug, Display},
     io::{Cursor, Read as _, Write as _},
@@ -24,7 +25,7 @@ use tokio::{
 use crate::{anyhow::anyhow, bail, get_version_number, message_proto::*, ResultType, Stream};
 // https://doc.rust-lang.org/std/os/windows/fs/trait.MetadataExt.html
 use crate::{
-    compress::{compress, decompress},
+    compress::{compress, decompress_with_limit, MAX_DECOMPRESSED_SIZE},
     config::Config,
 };
 
@@ -360,6 +361,23 @@ struct PendingWrite {
     modified_time: u64,
 }
 
+#[derive(Debug, Default)]
+struct WriteProgress {
+    file_num: i32,
+    bytes_written: u64,
+    next_block_id: u32,
+    eof_seen: bool,
+}
+
+impl WriteProgress {
+    fn new(file_num: i32) -> Self {
+        Self {
+            file_num,
+            ..Default::default()
+        }
+    }
+}
+
 impl Debug for DataStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -418,6 +436,10 @@ pub struct TransferJob {
     write_error: Option<String>,
     #[serde(skip_serializing)]
     is_read_job: bool,
+    #[serde(skip_serializing)]
+    write_progress: WriteProgress,
+    #[serde(skip_serializing)]
+    next_read_block_id: u32,
     pub total_size: u64,
     finished_size: u64,
     transferred: u64,
@@ -470,6 +492,14 @@ fn is_compressed_file(name: &str) -> bool {
     let compressed_exts = ["xz", "gz", "zip", "7z", "rar", "bz2", "tgz", "png", "jpg"];
     let ext = get_ext(name);
     compressed_exts.contains(&ext)
+}
+
+fn checked_total_size(files: &[FileEntry]) -> ResultType<u64> {
+    files.iter().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow!("declared file total size overflow"))
+    })
 }
 
 pub fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
@@ -886,6 +916,7 @@ impl TransferJob {
             show_hidden,
             is_remote,
             files: Vec::new(),
+            write_progress: WriteProgress::new(file_num),
             total_size: 0,
             enable_overwrite_detection,
             ..Default::default()
@@ -913,7 +944,7 @@ impl TransferJob {
             DataSource::FilePath(p) => {
                 let p = p.to_str().ok_or(anyhow!("Invalid path"))?;
                 let files = get_recursive_files(p, show_hidden)?;
-                let total_size = files.iter().map(|x| x.size).sum();
+                let total_size = checked_total_size(&files)?;
                 (files, total_size)
             }
             DataSource::MemoryCursor(c) => (Vec::new(), c.get_ref().len() as u64),
@@ -952,13 +983,15 @@ impl TransferJob {
     #[inline]
     pub fn set_files(&mut self, files: Vec<FileEntry>) -> ResultType<()> {
         validate_transfer_file_names(&files)?;
+        let total_size = checked_total_size(&files)?;
         if let DataSource::FilePath(base) = &self.data_source {
             for file in &files {
                 validate_no_symlink_components(base, &file.name)?;
             }
         }
-        self.total_size = files.iter().map(|x| x.size).sum();
+        self.total_size = total_size;
         self.files = files;
+        self.write_progress = WriteProgress::new(self.file_num);
         Ok(())
     }
 
@@ -1096,14 +1129,112 @@ impl TransferJob {
         if let Some(err) = self.write_error.as_ref() {
             bail!("cannot continue file transfer after resume failure: {err}");
         }
-        let file_num = block.file_num as usize;
-        if matches!(self.data_source, DataSource::FilePath(_)) && file_num >= self.files.len() {
-            bail!("Wrong file number");
+        if block.file_num < 0 {
+            bail!("wrong file number");
         }
-        let should_open = matches!(self.data_source, DataSource::FilePath(_))
-            && (file_num != self.file_num as usize || self.data_stream.is_none());
+        let file_num = usize::try_from(block.file_num).map_err(|_| anyhow!("wrong file number"))?;
+        let is_file_backed = matches!(self.data_source, DataSource::FilePath(_));
+        let starts_next_file = if is_file_backed {
+            if file_num >= self.files.len() {
+                bail!("wrong file number");
+            }
+            if block.file_num == self.write_progress.file_num {
+                if self.write_progress.eof_seen {
+                    bail!("file block received after end-of-file");
+                }
+                false
+            } else {
+                let next_file_num = self
+                    .write_progress
+                    .file_num
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("file number overflow"))?;
+                if block.file_num != next_file_num {
+                    bail!("out-of-order file number");
+                }
+                if !self.write_progress.eof_seen {
+                    bail!("next file received before end-of-file");
+                }
+                true
+            }
+        } else {
+            if block.file_num != self.write_progress.file_num {
+                bail!("out-of-order file number");
+            }
+            false
+        };
+
+        let bytes_written = if starts_next_file {
+            0
+        } else {
+            self.write_progress.bytes_written
+        };
+        let expected_block_id = if starts_next_file {
+            0
+        } else {
+            self.write_progress.next_block_id
+        };
+        if block.blk_id != expected_block_id {
+            bail!("out-of-order file block id");
+        }
+        let next_block_id = expected_block_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("file block id overflow"))?;
+
+        let remaining = if is_file_backed {
+            self.files[file_num]
+                .size
+                .checked_sub(bytes_written)
+                .ok_or_else(|| anyhow!("file payload exceeds declared size"))?
+        } else {
+            u64::MAX
+        };
+        let payload = if block.compressed {
+            let limit = usize::try_from(remaining.min(MAX_DECOMPRESSED_SIZE as u64))
+                .map_err(|_| anyhow!("remaining file budget is out of range"))?;
+            let decompressed = decompress_with_limit(&block.data, limit)
+                .map_err(|err| anyhow!("failed to decompress file block: {err}"))?;
+            if decompressed.is_empty() {
+                bail!("compressed file block cannot represent end-of-file");
+            }
+            Cow::Owned(decompressed)
+        } else {
+            Cow::Borrowed(block.data.as_ref())
+        };
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| anyhow!("file block length overflow"))?;
+        let new_file_size = bytes_written
+            .checked_add(payload_len)
+            .ok_or_else(|| anyhow!("written file size overflow"))?;
+        if is_file_backed && new_file_size > self.files[file_num].size {
+            bail!("file payload exceeds declared size");
+        }
+        let eof_seen = payload.is_empty();
+        if is_file_backed && eof_seen && new_file_size != self.files[file_num].size {
+            bail!("end-of-file received before declared file size");
+        }
+        let new_finished_size = self
+            .finished_size
+            .checked_add(payload_len)
+            .ok_or_else(|| anyhow!("finished file size overflow"))?;
+        if is_file_backed && new_finished_size > self.total_size {
+            bail!("transfer exceeds declared total size");
+        }
+        let wire_len =
+            u64::try_from(block.data.len()).map_err(|_| anyhow!("wire block length overflow"))?;
+        let new_transferred = self
+            .transferred
+            .checked_add(wire_len)
+            .ok_or_else(|| anyhow!("transferred byte count overflow"))?;
+
+        let should_open = is_file_backed
+            && (starts_next_file
+                || file_num != self.file_num as usize
+                || self.data_stream.is_none());
         if should_open {
-            self.finalize_pending_write().await?;
+            if starts_next_file {
+                self.finalize_pending_write().await?;
+            }
             self.file_num = block.file_num;
             let (base, entry) = match &self.data_source {
                 DataSource::FilePath(base) => (base.clone(), self.files[file_num].clone()),
@@ -1127,23 +1258,19 @@ impl TransferJob {
                 self.data_stream = Some(DataStream::BufStream(TokioBufStream::new(cursor.clone())));
             }
         }
-        if block.compressed {
-            let tmp = decompress(&block.data);
-            self.data_stream
-                .as_mut()
-                .ok_or(anyhow!("data stream is None"))?
-                .write_all(&tmp)
-                .await?;
-            self.finished_size += tmp.len() as u64;
-        } else {
-            self.data_stream
-                .as_mut()
-                .ok_or(anyhow!("file is None"))?
-                .write_all(&block.data)
-                .await?;
-            self.finished_size += block.data.len() as u64;
-        }
-        self.transferred += block.data.len() as u64;
+        self.data_stream
+            .as_mut()
+            .ok_or(anyhow!("file is None"))?
+            .write_all(&payload)
+            .await?;
+        self.finished_size = new_finished_size;
+        self.transferred = new_transferred;
+        self.write_progress = WriteProgress {
+            file_num: block.file_num,
+            bytes_written: new_file_size,
+            next_block_id,
+            eof_seen,
+        };
         Ok(())
     }
 
@@ -1253,7 +1380,9 @@ impl TransferJob {
             return Ok(None);
         }
 
-        let file_num = self.file_num as usize;
+        let file_num_i32 = self.file_num;
+        let file_num = usize::try_from(file_num_i32).map_err(|_| anyhow!("wrong file number"))?;
+        let block_id = self.next_read_block_id;
         let name = match &self.data_source {
             DataSource::FilePath(p) => {
                 if file_num >= self.files.len() {
@@ -1303,12 +1432,21 @@ impl TransferJob {
                 self.data_stream.take();
                 return Ok(None);
             }
-            self.file_num += 1;
+            self.file_num = self
+                .file_num
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("file number overflow"))?;
             self.data_stream = None;
             self.file_confirmed = false;
             self.file_is_waiting = false;
+            self.next_read_block_id = 0;
         } else {
-            self.finished_size += offset as u64;
+            let offset =
+                u64::try_from(offset).map_err(|_| anyhow!("file block length overflow"))?;
+            self.finished_size = self
+                .finished_size
+                .checked_add(offset)
+                .ok_or_else(|| anyhow!("finished file size overflow"))?;
             if matches!(self.data_source, DataSource::FilePath(_)) && !is_compressed_file(name) {
                 let tmp = compress(&buf);
                 if tmp.len() < buf.len() {
@@ -1316,13 +1454,23 @@ impl TransferJob {
                     compressed = true;
                 }
             }
-            self.transferred += buf.len() as u64;
+            let wire_len =
+                u64::try_from(buf.len()).map_err(|_| anyhow!("wire block length overflow"))?;
+            self.transferred = self
+                .transferred
+                .checked_add(wire_len)
+                .ok_or_else(|| anyhow!("transferred byte count overflow"))?;
+            self.next_read_block_id = self
+                .next_read_block_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("file block id overflow"))?;
         }
         Ok(Some(FileTransferBlock {
             id: self.id,
-            file_num: file_num as _,
+            file_num: file_num_i32,
             data: buf.into(),
             compressed,
+            blk_id: block_id,
             ..Default::default()
         }))
     }
@@ -1418,6 +1566,7 @@ impl TransferJob {
         self.set_file_confirmed(false);
         self.set_file_is_waiting(false);
         self.file_num += 1;
+        self.next_read_block_id = 0;
         self.file_skipped = true;
         true
     }
@@ -1433,6 +1582,20 @@ impl TransferJob {
             }
             DataSource::MemoryCursor(_) => bail!("memory transfers cannot be resumed"),
         };
+        if offset > entry.size {
+            bail!("resume offset exceeds declared file size");
+        }
+        let resumed_transferred = self
+            .transferred
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("transferred byte count overflow"))?;
+        let resumed_finished_size = self
+            .finished_size
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("finished file size overflow"))?;
+        if resumed_finished_size > self.total_size {
+            bail!("resume offset exceeds declared total size");
+        }
         if self.is_read_job {
             let path = Self::join(&base, &entry.name);
             let mut file = File::open(&path).await?;
@@ -1441,8 +1604,9 @@ impl TransferJob {
             }
             file.seek(std::io::SeekFrom::Start(offset)).await?;
             self.data_stream = Some(DataStream::FileStream(file));
-            self.transferred += offset;
-            self.finished_size += offset;
+            self.transferred = resumed_transferred;
+            self.finished_size = resumed_finished_size;
+            self.next_read_block_id = 0;
             return Ok(());
         }
         let digest = self.digest.clone();
@@ -1460,8 +1624,15 @@ impl TransferJob {
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         self.data_stream = Some(DataStream::FileStream(file));
         self.pending_write = Some(pending);
-        self.transferred += offset;
-        self.finished_size += offset;
+        self.transferred = resumed_transferred;
+        self.finished_size = resumed_finished_size;
+        self.file_num = i32::try_from(file_num).map_err(|_| anyhow!("wrong file number"))?;
+        self.write_progress = WriteProgress {
+            file_num: self.file_num,
+            bytes_written: offset,
+            next_block_id: 0,
+            eof_seen: false,
+        };
         Ok(())
     }
 
@@ -1861,6 +2032,7 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::decompress;
 
     struct TestTempDir {
         path: PathBuf,
@@ -1912,6 +2084,8 @@ mod tests {
     }
 
     fn new_write_job(id: i32, download_dir: PathBuf, name: &str) -> ResultType<TransferJob> {
+        let mut entry = new_file_entry(name);
+        entry.size = u64::MAX;
         let job = TransferJob::new_write(
             id,
             JobType::Generic,
@@ -1922,8 +2096,34 @@ mod tests {
             true,
             false,
         )
-        .with_files(vec![new_file_entry(name)])?;
+        .with_files(vec![entry])?;
         Ok(job)
+    }
+
+    fn new_sized_write_job(
+        id: i32,
+        download_dir: PathBuf,
+        files: &[(&str, u64)],
+    ) -> ResultType<TransferJob> {
+        let entries = files
+            .iter()
+            .map(|(name, size)| {
+                let mut entry = new_file_entry(name);
+                entry.size = *size;
+                entry
+            })
+            .collect();
+        TransferJob::new_write(
+            id,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(download_dir),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(entries)
     }
 
     fn transfer_block(id: i32, file_num: i32, data: &[u8]) -> FileTransferBlock {
@@ -1931,6 +2131,23 @@ mod tests {
             id,
             file_num,
             data: data.to_vec().into(),
+            ..Default::default()
+        }
+    }
+
+    fn sequenced_block(
+        id: i32,
+        file_num: i32,
+        block_id: u32,
+        data: &[u8],
+        compressed: bool,
+    ) -> FileTransferBlock {
+        FileTransferBlock {
+            id,
+            file_num,
+            blk_id: block_id,
+            data: data.to_vec().into(),
+            compressed,
             ..Default::default()
         }
     }
@@ -2164,8 +2381,8 @@ mod tests {
         let downloads = tmp_root.join("downloads");
         std::fs::create_dir_all(&downloads).expect("create downloads directory");
         let modified = 1_700_000_001;
-        let mut first =
-            new_write_job(109, downloads.clone(), "report.txt").expect("create first job");
+        let mut first = new_sized_write_job(109, downloads.clone(), &[("report.txt", 6)])
+            .expect("create first job");
         first.files[0].modified_time = modified;
         first.set_digest(6, modified);
         first
@@ -2197,8 +2414,8 @@ mod tests {
         };
         assert_eq!(confirmation.transferred_size, 3);
 
-        let mut resumed =
-            new_write_job(110, downloads.clone(), "report.txt").expect("create resumed job");
+        let mut resumed = new_sized_write_job(110, downloads.clone(), &[("report.txt", 6)])
+            .expect("create resumed job");
         resumed.files[0].modified_time = modified;
         resumed.set_digest(6, modified);
         assert!(
@@ -2216,6 +2433,10 @@ mod tests {
             .write(transfer_block(110, 0, b"def"))
             .await
             .expect("append resumed segment");
+        resumed
+            .write(sequenced_block(110, 0, 1, b"", false))
+            .await
+            .expect("finish resumed file");
         resumed
             .modify_time()
             .await
@@ -2262,6 +2483,7 @@ mod tests {
         };
 
         assert_eq!(data, b"def");
+        assert_eq!(block.blk_id, 0);
         assert_eq!(job.finished_size(), 6);
     }
 
@@ -2406,6 +2628,379 @@ mod tests {
             ])
             .expect_err("any traversal entry must reject the full file list");
         assert_err_contains(err, "path traversal");
+    }
+
+    #[test]
+    fn set_files_rejects_total_size_overflow() {
+        let mut job = new_validation_job(117);
+        let mut original = new_file_entry("original.bin");
+        original.size = 7;
+        job.set_files(vec![original])
+            .expect("set initial valid file list");
+        let mut first = new_file_entry("first.bin");
+        first.size = u64::MAX;
+        let mut second = new_file_entry("second.bin");
+        second.size = 1;
+
+        let err = job
+            .set_files(vec![first, second])
+            .expect_err("declared total size overflow must be rejected");
+
+        assert_err_contains(err, "total size overflow");
+        assert_eq!(job.files().len(), 1);
+        assert_eq!(job.files()[0].name, "original.bin");
+        assert_eq!(job.total_size(), 7);
+    }
+
+    #[tokio::test]
+    async fn write_rejects_payload_beyond_declared_file_size_before_opening_temp() {
+        let tmp_root = TestTempDir::new("camellia_declared_file_budget");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job = new_sized_write_job(118, downloads.clone(), &[("report.txt", 3)])
+            .expect("create sized write job");
+
+        let result = job.write(sequenced_block(118, 0, 0, b"four", false)).await;
+
+        assert!(result.is_err(), "oversized file payload must be rejected");
+        assert_eq!(job.finished_size(), 0);
+        assert_eq!(job.transferred(), 0);
+        assert!(std::fs::read_dir(&downloads)
+            .expect("read downloads directory")
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn write_rejects_skipped_file_and_out_of_order_block_id() {
+        let tmp_root = TestTempDir::new("camellia_file_block_sequence");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut skipped = new_sized_write_job(
+            119,
+            downloads.clone(),
+            &[("first.bin", 1), ("second.bin", 1)],
+        )
+        .expect("create multi-file write job");
+        let mut reordered = new_sized_write_job(120, downloads.clone(), &[("ordered.bin", 1)])
+            .expect("create sequenced write job");
+
+        assert!(
+            skipped
+                .write(sequenced_block(119, 1, 0, b"b", false))
+                .await
+                .is_err(),
+            "the first file cannot be skipped"
+        );
+        assert!(
+            reordered
+                .write(sequenced_block(120, 0, 1, b"a", false))
+                .await
+                .is_err(),
+            "the first block id must be zero"
+        );
+        assert_eq!(skipped.finished_size(), 0);
+        assert_eq!(reordered.finished_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_bounds_compressed_output_by_remaining_file_budget_and_propagates_errors() {
+        let tmp_root = TestTempDir::new("camellia_compressed_file_budget");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let compressed = zstd::encode_all(&b"abcde"[..], 0).expect("compress oversized payload");
+        let mut oversized = new_sized_write_job(121, downloads.clone(), &[("oversized.bin", 4)])
+            .expect("create compressed write job");
+        let mut malformed = new_sized_write_job(122, downloads.clone(), &[("malformed.bin", 4)])
+            .expect("create malformed write job");
+
+        assert!(
+            oversized
+                .write(sequenced_block(121, 0, 0, &compressed, true))
+                .await
+                .is_err(),
+            "decompressed output beyond the remaining file budget must fail"
+        );
+        assert!(
+            malformed
+                .write(sequenced_block(122, 0, 0, b"not-zstd", true))
+                .await
+                .is_err(),
+            "malformed compressed data must not become an empty success"
+        );
+        assert_eq!(oversized.finished_size(), 0);
+        assert_eq!(malformed.finished_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_accepts_complete_two_file_sequence_and_exact_compressed_budget() {
+        let tmp_root = TestTempDir::new("camellia_complete_file_sequence");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job = new_sized_write_job(
+            123,
+            downloads.clone(),
+            &[("first.bin", 3), ("second.bin", 2)],
+        )
+        .expect("create two-file write job");
+
+        job.write(sequenced_block(123, 0, 0, b"ab", false))
+            .await
+            .expect("write first data block");
+        job.write(sequenced_block(123, 0, 1, b"c", false))
+            .await
+            .expect("write second data block");
+        job.write(sequenced_block(123, 0, 2, b"", false))
+            .await
+            .expect("write first file EOF");
+        job.write(sequenced_block(123, 1, 0, b"de", false))
+            .await
+            .expect("write second file block");
+        job.write(sequenced_block(123, 1, 1, b"", false))
+            .await
+            .expect("write second file EOF");
+        job.modify_time().await.expect("commit final file");
+
+        assert_eq!(std::fs::read(downloads.join("first.bin")).unwrap(), b"abc");
+        assert_eq!(std::fs::read(downloads.join("second.bin")).unwrap(), b"de");
+        assert_eq!(job.finished_size(), 5);
+        assert_eq!(job.transferred(), 5);
+
+        let compressed_downloads = tmp_root.join("compressed");
+        std::fs::create_dir_all(&compressed_downloads)
+            .expect("create compressed downloads directory");
+        let compressed = zstd::encode_all(&b"four"[..], 0).expect("compress exact payload");
+        let mut compressed_job =
+            new_sized_write_job(124, compressed_downloads.clone(), &[("exact.bin", 4)])
+                .expect("create exact compressed job");
+        compressed_job
+            .write(sequenced_block(124, 0, 0, &compressed, true))
+            .await
+            .expect("write exact compressed block");
+        compressed_job
+            .write(sequenced_block(124, 0, 1, b"", false))
+            .await
+            .expect("write compressed file EOF");
+        compressed_job
+            .modify_time()
+            .await
+            .expect("commit compressed file");
+        assert_eq!(
+            std::fs::read(compressed_downloads.join("exact.bin")).unwrap(),
+            b"four"
+        );
+        assert_eq!(compressed_job.finished_size(), 4);
+        assert_eq!(compressed_job.transferred(), compressed.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn write_rejects_duplicate_gap_early_eof_and_illegal_file_transitions() {
+        let tmp_root = TestTempDir::new("camellia_rejected_file_sequences");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+
+        let mut blocks = new_sized_write_job(125, downloads.clone(), &[("blocks.bin", 2)])
+            .expect("create block sequence job");
+        blocks
+            .write(sequenced_block(125, 0, 0, b"a", false))
+            .await
+            .expect("write first block");
+        assert!(
+            blocks
+                .write(sequenced_block(125, 0, 0, b"b", false))
+                .await
+                .is_err(),
+            "duplicate block id must fail"
+        );
+        assert!(
+            blocks
+                .write(sequenced_block(125, 0, 2, b"b", false))
+                .await
+                .is_err(),
+            "block id gaps must fail"
+        );
+        assert!(
+            blocks
+                .write(sequenced_block(125, 0, 1, b"", false))
+                .await
+                .is_err(),
+            "EOF before the declared size must fail"
+        );
+        blocks
+            .write(sequenced_block(125, 0, 1, b"b", false))
+            .await
+            .expect("rejected blocks must not consume sequence state");
+        assert!(
+            blocks
+                .write(sequenced_block(125, 0, 2, b"c", false))
+                .await
+                .is_err(),
+            "data after the declared size must fail"
+        );
+        blocks
+            .write(sequenced_block(125, 0, 2, b"", false))
+            .await
+            .expect("write exact EOF");
+        assert!(
+            blocks
+                .write(sequenced_block(125, 0, 3, b"", false))
+                .await
+                .is_err(),
+            "duplicate EOF must fail"
+        );
+        assert_eq!(blocks.finished_size(), 2);
+        assert_eq!(blocks.transferred(), 2);
+
+        let mut files = new_sized_write_job(
+            126,
+            downloads.clone(),
+            &[("transition-a.bin", 1), ("transition-b.bin", 1)],
+        )
+        .expect("create file transition job");
+        files
+            .write(sequenced_block(126, 0, 0, b"a", false))
+            .await
+            .expect("fill first file");
+        assert!(
+            files
+                .write(sequenced_block(126, 1, 0, b"b", false))
+                .await
+                .is_err(),
+            "next file before EOF must fail"
+        );
+        files
+            .write(sequenced_block(126, 0, 1, b"", false))
+            .await
+            .expect("finish first file");
+        files
+            .write(sequenced_block(126, 1, 0, b"b", false))
+            .await
+            .expect("advance exactly one file");
+        assert!(
+            files
+                .write(sequenced_block(126, 0, 2, b"", false))
+                .await
+                .is_err(),
+            "backward file numbers must fail"
+        );
+        assert!(
+            files
+                .write(sequenced_block(126, 3, 0, b"", false))
+                .await
+                .is_err(),
+            "skipped file numbers must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_requires_explicit_eof_for_zero_size_files() {
+        let tmp_root = TestTempDir::new("camellia_zero_size_file_sequence");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+        let mut job =
+            new_sized_write_job(127, downloads.clone(), &[("empty.bin", 0), ("one.bin", 1)])
+                .expect("create zero-size file job");
+
+        assert!(
+            job.write(sequenced_block(127, 0, 0, b"x", false))
+                .await
+                .is_err(),
+            "a zero-size file cannot accept data"
+        );
+        job.write(sequenced_block(127, 0, 0, b"", false))
+            .await
+            .expect("empty file must accept its explicit EOF");
+        job.write(sequenced_block(127, 1, 0, b"x", false))
+            .await
+            .expect("write file after empty file");
+        job.write(sequenced_block(127, 1, 1, b"", false))
+            .await
+            .expect("finish file after empty file");
+        job.modify_time().await.expect("commit zero-size sequence");
+
+        assert_eq!(std::fs::read(downloads.join("empty.bin")).unwrap(), b"");
+        assert_eq!(std::fs::read(downloads.join("one.bin")).unwrap(), b"x");
+        assert_eq!(job.finished_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn sender_assigns_contiguous_block_ids_including_eof() {
+        const BLOCK_SIZE: usize = 128 * 1024;
+        let tmp_root = TestTempDir::new("camellia_sender_block_ids");
+        let source = tmp_root.join("source.bin");
+        std::fs::create_dir_all(&tmp_root.path).expect("create source directory");
+        std::fs::write(&source, vec![b'x'; BLOCK_SIZE + 1]).expect("create multi-block source");
+        let mut job = TransferJob::new_read(
+            128,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(source),
+            0,
+            false,
+            true,
+            false,
+        )
+        .expect("create sender job");
+        assert!(!job.open_data_stream().await.expect("open source stream"));
+
+        let first = job.read().await.unwrap().expect("first data block");
+        let second = job.read().await.unwrap().expect("second data block");
+        let eof = job.read().await.unwrap().expect("EOF block");
+
+        assert_eq!((first.file_num, first.blk_id), (0, 0));
+        assert_eq!((second.file_num, second.blk_id), (0, 1));
+        assert_eq!((eof.file_num, eof.blk_id), (0, 2));
+        assert!(eof.data.is_empty());
+        assert!(!eof.compressed);
+        assert!(job.read().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn write_rejects_counter_and_block_id_overflow_before_opening_temp() {
+        let tmp_root = TestTempDir::new("camellia_transfer_counter_overflow");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads directory");
+
+        let mut finished =
+            new_sized_write_job(129, downloads.clone(), &[("finished.bin", u64::MAX)])
+                .expect("create finished counter job");
+        finished.finished_size = u64::MAX;
+        assert!(
+            finished
+                .write(sequenced_block(129, 0, 0, b"x", false))
+                .await
+                .is_err(),
+            "finished byte counter overflow must fail"
+        );
+
+        let mut transferred =
+            new_sized_write_job(130, downloads.clone(), &[("transferred.bin", u64::MAX)])
+                .expect("create transferred counter job");
+        transferred.transferred = u64::MAX;
+        assert!(
+            transferred
+                .write(sequenced_block(130, 0, 0, b"x", false))
+                .await
+                .is_err(),
+            "wire byte counter overflow must fail"
+        );
+
+        let mut block_id =
+            new_sized_write_job(131, downloads.clone(), &[("block-id.bin", u64::MAX)])
+                .expect("create block id counter job");
+        block_id.write_progress.next_block_id = u32::MAX;
+        assert!(
+            block_id
+                .write(sequenced_block(131, 0, u32::MAX, b"x", false))
+                .await
+                .is_err(),
+            "block id overflow must fail"
+        );
+
+        assert!(std::fs::read_dir(&downloads)
+            .expect("read downloads directory")
+            .next()
+            .is_none());
     }
 
     #[cfg(windows)]
