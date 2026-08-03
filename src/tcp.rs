@@ -24,8 +24,49 @@ use tokio_util::codec::Framed;
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
+/// The role in the session-key exchange. The initiator creates and seals the
+/// symmetric key; the responder opens it. Roles are part of the implicit nonce
+/// domain and must never be guessed from socket direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CipherRole {
+    Initiator,
+    Responder,
+}
+
+#[derive(Clone, Copy)]
+enum CipherDirection {
+    InitiatorToResponder,
+    ResponderToInitiator,
+}
+
+impl CipherRole {
+    fn send_direction(self) -> CipherDirection {
+        match self {
+            Self::Initiator => CipherDirection::InitiatorToResponder,
+            Self::Responder => CipherDirection::ResponderToInitiator,
+        }
+    }
+
+    fn receive_direction(self) -> CipherDirection {
+        match self {
+            Self::Initiator => CipherDirection::ResponderToInitiator,
+            Self::Responder => CipherDirection::InitiatorToResponder,
+        }
+    }
+}
+
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64);
+pub struct Encrypt {
+    key: Key,
+    send_seq: u64,
+    receive_seq: u64,
+    role: CipherRole,
+}
+
+/// Version byte sealed together with every newly generated session key.
+/// Changing the nonce domain or key-envelope format requires a new version.
+pub const SESSION_CIPHER_VERSION: u8 = 1;
+const SESSION_NONCE_DOMAIN: &[u8; 15] = b"camellia-rem-v1";
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -195,13 +236,18 @@ impl FramedStream {
         super::timeout(ms, self.next()).await.unwrap_or_default()
     }
 
-    pub fn set_key(&mut self, key: Key) {
-        self.2 = Some(Encrypt::new(key));
+    pub fn set_key(&mut self, key: Key, role: CipherRole) {
+        self.2 = Some(Encrypt::new(key, role));
     }
 
-    fn get_nonce(seqnum: u64) -> Nonce {
+    fn get_nonce(seqnum: u64, direction: CipherDirection) -> Nonce {
         let mut nonce = Nonce([0u8; secretbox::NONCEBYTES]);
         nonce.0[..std::mem::size_of_val(&seqnum)].copy_from_slice(&seqnum.to_le_bytes());
+        nonce.0[8..23].copy_from_slice(SESSION_NONCE_DOMAIN);
+        nonce.0[23] = match direction {
+            CipherDirection::InitiatorToResponder => 0x49,
+            CipherDirection::ResponderToInitiator => 0x52,
+        };
         nonce
     }
 }
@@ -293,8 +339,13 @@ impl AsyncWrite for DynTcpStream {
 impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
-    pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+    pub fn new(key: Key, role: CipherRole) -> Self {
+        Self {
+            key,
+            send_seq: 0,
+            receive_seq: 0,
+            role,
+        }
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
@@ -305,13 +356,13 @@ impl Encrypt {
             ));
         }
         let seqnum = self
-            .2
+            .receive_seq
             .checked_add(1)
             .ok_or_else(|| Error::new(io::ErrorKind::InvalidData, "receive sequence exhausted"))?;
-        let nonce = FramedStream::get_nonce(seqnum);
-        match secretbox::open(bytes, &nonce, &self.0) {
+        let nonce = FramedStream::get_nonce(seqnum, self.role.receive_direction());
+        match secretbox::open(bytes, &nonce, &self.key) {
             Ok(res) => {
-                self.2 = seqnum;
+                self.receive_seq = seqnum;
                 bytes.clear();
                 bytes.put_slice(&res);
                 Ok(())
@@ -324,9 +375,22 @@ impl Encrypt {
     }
 
     pub fn enc(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
-        self.1 += 1;
-        let nonce = FramedStream::get_nonce(self.1);
-        secretbox::seal(data, &nonce, &self.0).map_err(|_| Error::other("encryption error"))
+        let seqnum = self
+            .send_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::other("send sequence exhausted"))?;
+        let nonce = FramedStream::get_nonce(seqnum, self.role.send_direction());
+        let ciphertext = secretbox::seal(data, &nonce, &self.key)
+            .map_err(|_| Error::other("encryption error"))?;
+        self.send_seq = seqnum;
+        Ok(ciphertext)
+    }
+
+    pub fn encode_session_key(key: &Key) -> Vec<u8> {
+        let mut envelope = Vec::with_capacity(secretbox::KEYBYTES + 1);
+        envelope.push(SESSION_CIPHER_VERSION);
+        envelope.extend_from_slice(&key.0);
+        envelope
     }
 
     pub fn decode(
@@ -341,13 +405,19 @@ impl Encrypt {
         let mut pk_ = [0u8; box_::PUBLICKEYBYTES];
         pk_[..].copy_from_slice(their_pk_b);
         let their_pk_b = box_::PublicKey(pk_);
-        let symmetric_key = box_::open(symmetric_data, &nonce, &their_pk_b, our_sk_b)
+        let key_envelope = box_::open(symmetric_data, &nonce, &their_pk_b, our_sk_b)
             .map_err(|_| anyhow::anyhow!("Handshake failed: box decryption failure"))?;
-        if symmetric_key.len() != secretbox::KEYBYTES {
-            anyhow::bail!("Handshake failed: invalid secret key length from peer");
+        if key_envelope.len() != secretbox::KEYBYTES + 1 {
+            anyhow::bail!("Handshake failed: invalid session-key envelope length");
+        }
+        if key_envelope[0] != SESSION_CIPHER_VERSION {
+            anyhow::bail!(
+                "Handshake failed: unsupported session cipher version {}",
+                key_envelope[0]
+            );
         }
         let mut key = [0u8; secretbox::KEYBYTES];
-        key[..].copy_from_slice(&symmetric_key);
+        key.copy_from_slice(&key_envelope[1..]);
         Ok(Key(key))
     }
 }
@@ -361,20 +431,126 @@ mod tests {
     }
 
     #[test]
+    fn opposite_directions_do_not_reuse_the_same_key_nonce_pair() {
+        let client_plaintext = b"known client request";
+        let server_plaintext = b"secret server reply!";
+        assert_eq!(client_plaintext.len(), server_plaintext.len());
+
+        let mut client = Encrypt::new(test_key(), CipherRole::Initiator);
+        let mut server = Encrypt::new(test_key(), CipherRole::Responder);
+        let client_ciphertext = client.enc(client_plaintext).expect("client encryption");
+        let server_ciphertext = server.enc(server_plaintext).expect("server encryption");
+
+        let ciphertext_xor = client_ciphertext[secretbox::MACBYTES..]
+            .iter()
+            .zip(&server_ciphertext[secretbox::MACBYTES..])
+            .map(|(left, right)| left ^ right)
+            .collect::<Vec<_>>();
+        let plaintext_xor = client_plaintext
+            .iter()
+            .zip(server_plaintext)
+            .map(|(left, right)| left ^ right)
+            .collect::<Vec<_>>();
+
+        assert_ne!(
+            ciphertext_xor, plaintext_xor,
+            "opposite directions reused the SecretBox keystream"
+        );
+    }
+
+    #[test]
+    fn opposite_roles_decrypt_both_directions() {
+        let mut initiator = Encrypt::new(test_key(), CipherRole::Initiator);
+        let mut responder = Encrypt::new(test_key(), CipherRole::Responder);
+
+        let mut request = BytesMut::from(
+            initiator
+                .enc(b"request")
+                .expect("initiator encryption")
+                .as_slice(),
+        );
+        responder.dec(&mut request).expect("responder decryption");
+        assert_eq!(&request[..], b"request");
+
+        let mut response = BytesMut::from(
+            responder
+                .enc(b"response")
+                .expect("responder encryption")
+                .as_slice(),
+        );
+        initiator.dec(&mut response).expect("initiator decryption");
+        assert_eq!(&response[..], b"response");
+    }
+
+    #[test]
+    fn same_roles_cannot_decrypt_each_other() {
+        let mut sender = Encrypt::new(test_key(), CipherRole::Initiator);
+        let mut wrong_role_receiver = Encrypt::new(test_key(), CipherRole::Initiator);
+        let ciphertext = sender.enc(b"role-bound").expect("sender encryption");
+        let mut frame = BytesMut::from(ciphertext.as_slice());
+
+        assert!(wrong_role_receiver.dec(&mut frame).is_err());
+        assert_eq!(wrong_role_receiver.receive_seq, 0);
+    }
+
+    #[test]
+    fn sequence_exhaustion_fails_without_wrapping() {
+        let mut encryptor = Encrypt::new(test_key(), CipherRole::Initiator);
+        encryptor.send_seq = u64::MAX;
+        assert!(encryptor.enc(b"must not wrap").is_err());
+        assert_eq!(encryptor.send_seq, u64::MAX);
+
+        let mut decryptor = Encrypt::new(test_key(), CipherRole::Responder);
+        decryptor.receive_seq = u64::MAX;
+        let mut frame = BytesMut::from(vec![0u8; secretbox::MACBYTES].as_slice());
+        assert!(decryptor.dec(&mut frame).is_err());
+        assert_eq!(decryptor.receive_seq, u64::MAX);
+    }
+
+    #[test]
+    fn legacy_unversioned_session_key_envelope_is_rejected() {
+        let (responder_pk, responder_sk) = box_::gen_keypair();
+        let (initiator_pk, initiator_sk) = box_::gen_keypair();
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let legacy = box_::seal(&test_key().0, &nonce, &responder_pk, &initiator_sk)
+            .expect("legacy key envelope encryption");
+
+        let error = match Encrypt::decode(&legacy, &initiator_pk.0, &responder_sk) {
+            Ok(_) => panic!("unversioned key envelope must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("envelope length"));
+    }
+
+    #[test]
+    fn versioned_session_key_envelope_round_trips() {
+        let (responder_pk, responder_sk) = box_::gen_keypair();
+        let (initiator_pk, initiator_sk) = box_::gen_keypair();
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let envelope = Encrypt::encode_session_key(&test_key());
+        let sealed = box_::seal(&envelope, &nonce, &responder_pk, &initiator_sk)
+            .expect("session key envelope encryption");
+
+        let decoded = Encrypt::decode(&sealed, &initiator_pk.0, &responder_sk)
+            .expect("versioned key envelope must decode");
+        assert_eq!(decoded.0, test_key().0);
+    }
+
+    #[test]
     fn decryption_rejects_unauthenticated_frames_without_advancing_sequence() {
         for len in 0..=secretbox::MACBYTES {
-            let mut decryptor = Encrypt::new(test_key());
+            let mut decryptor = Encrypt::new(test_key(), CipherRole::Responder);
             let mut frame = BytesMut::from(vec![0x41; len].as_slice());
 
             assert!(decryptor.dec(&mut frame).is_err(), "length {len}");
-            assert_eq!(decryptor.2, 0, "length {len}");
+            assert_eq!(decryptor.receive_seq, 0, "length {len}");
         }
     }
 
     #[test]
     fn decryption_accepts_authenticated_empty_plaintext_at_mac_boundary() {
-        let mut encryptor = Encrypt::new(test_key());
-        let mut decryptor = Encrypt::new(test_key());
+        let mut encryptor = Encrypt::new(test_key(), CipherRole::Initiator);
+        let mut decryptor = Encrypt::new(test_key(), CipherRole::Responder);
         let ciphertext = encryptor.enc(&[]).expect("empty plaintext must encrypt");
         assert_eq!(ciphertext.len(), secretbox::MACBYTES);
 
@@ -384,28 +560,28 @@ mod tests {
             .expect("authenticated empty plaintext must decrypt");
 
         assert!(frame.is_empty());
-        assert_eq!(decryptor.2, 1);
+        assert_eq!(decryptor.receive_seq, 1);
     }
 
     #[test]
     fn failed_authentication_does_not_consume_the_expected_nonce() {
-        let mut encryptor = Encrypt::new(test_key());
+        let mut encryptor = Encrypt::new(test_key(), CipherRole::Initiator);
         let ciphertext = encryptor
             .enc(b"authenticated payload")
             .expect("payload must encrypt");
         let mut tampered = ciphertext.clone();
         tampered[0] ^= 0x80;
 
-        let mut decryptor = Encrypt::new(test_key());
+        let mut decryptor = Encrypt::new(test_key(), CipherRole::Responder);
         let mut tampered_frame = BytesMut::from(tampered.as_slice());
         assert!(decryptor.dec(&mut tampered_frame).is_err());
-        assert_eq!(decryptor.2, 0);
+        assert_eq!(decryptor.receive_seq, 0);
 
         let mut valid_frame = BytesMut::from(ciphertext.as_slice());
         decryptor
             .dec(&mut valid_frame)
             .expect("the expected nonce must remain available after rejection");
         assert_eq!(&valid_frame[..], b"authenticated payload");
-        assert_eq!(decryptor.2, 1);
+        assert_eq!(decryptor.receive_seq, 1);
     }
 }

@@ -155,8 +155,8 @@ impl WsFramedStream {
     }
 
     #[inline]
-    pub fn set_key(&mut self, key: Key) {
-        self.encrypt = Some(Encrypt::new(key));
+    pub fn set_key(&mut self, key: Key, role: crate::tcp::CipherRole) {
+        self.encrypt = Some(Encrypt::new(key, role));
     }
 
     #[inline]
@@ -430,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn secured_websocket_rejects_text_and_closes() {
         let (mut receiver, mut sender) = websocket_pair().await;
-        receiver.set_key(test_key());
+        receiver.set_key(test_key(), crate::tcp::CipherRole::Responder);
         sender
             .send(WsMessage::Text("unauthenticated".into()))
             .await
@@ -448,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn secured_websocket_rejects_short_binary_and_closes() {
         let (mut receiver, mut sender) = websocket_pair().await;
-        receiver.set_key(test_key());
+        receiver.set_key(test_key(), crate::tcp::CipherRole::Responder);
         sender
             .send(WsMessage::Binary(vec![0x41].into()))
             .await
@@ -466,11 +466,11 @@ mod tests {
     #[tokio::test]
     async fn secured_websocket_accepts_authenticated_binary() {
         let (mut receiver, mut sender) = websocket_pair().await;
-        let mut encryptor = Encrypt::new(test_key());
+        let mut encryptor = Encrypt::new(test_key(), crate::tcp::CipherRole::Initiator);
         let ciphertext = encryptor
             .enc(b"authenticated")
             .expect("payload must encrypt");
-        receiver.set_key(test_key());
+        receiver.set_key(test_key(), crate::tcp::CipherRole::Responder);
         sender
             .send(WsMessage::Binary(ciphertext.into()))
             .await
