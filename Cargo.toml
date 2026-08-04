@@ -48,7 +48,7 @@ uuid = { version = "1.16", features = ["v4"] }
 sysinfo = { git = "https://github.com/rustdesk-org/sysinfo", rev = "90b1705d909a4902dbbbdea37ee64db17841077d" }
 thiserror = "1.0"
 httparse = "1.10"
-base64 = "0.22"
+base64 = "0.23"
 url = "2.5"
 sha2 = "0.11"
 whoami = "2.1"
