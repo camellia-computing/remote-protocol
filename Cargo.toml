@@ -42,7 +42,7 @@ tokio-socks = { git = "https://github.com/rustdesk-org/tokio-socks", rev = "bdb9
 chrono = "0.4"
 backtrace = "0.3"
 libc = "0.2"
-toml = "0.7"
+toml = "1.1"
 uuid = { version = "1.16", features = ["v4"] }
 # new sysinfo issue: https://github.com/rustdesk/rustdesk/pull/6330#issuecomment-2270871442
 sysinfo = { git = "https://github.com/rustdesk-org/sysinfo", rev = "90b1705d909a4902dbbbdea37ee64db17841077d" }
