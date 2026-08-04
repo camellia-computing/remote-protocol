@@ -459,6 +459,16 @@ message FileTransferError {
   int32 id = 1;
   string error = 2;
   sint32 file_num = 3;
+  // Non-transfer file operations have no job id. Preserve their request path
+  // and operation so the caller can fail the matching pending UI request.
+  string path = 4;
+  FileErrorOperation operation = 5;
+}
+
+enum FileErrorOperation {
+  Transfer = 0;
+  ReadDir = 1;
+  ReadEmptyDirs = 2;
 }
 
 message FileTransferSendRequest {

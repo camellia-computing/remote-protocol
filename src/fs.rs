@@ -22,7 +22,12 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream as TokioBufStream},
 };
 
-use crate::{anyhow::anyhow, bail, get_version_number, message_proto::*, ResultType, Stream};
+use crate::{
+    anyhow::{anyhow, Context},
+    bail, get_version_number,
+    message_proto::*,
+    ResultType, Stream,
+};
 // https://doc.rust-lang.org/std/os/windows/fs/trait.MetadataExt.html
 use crate::{
     compress::{compress, decompress_with_limit, MAX_DECOMPRESSED_SIZE},
@@ -40,12 +45,12 @@ pub fn update_next_job_id(id: i32) {
 }
 
 pub fn read_dir(path: &Path, include_hidden: bool) -> ResultType<FileDirectory> {
-    let mut dir = FileDirectory {
-        path: get_string(path),
-        ..Default::default()
-    };
     #[cfg(windows)]
     if "/" == &get_string(path) {
+        let mut dir = FileDirectory {
+            path: get_string(path),
+            ..Default::default()
+        };
         let drives = unsafe { winapi::um::fileapi::GetLogicalDrives() };
         for i in 0..32 {
             if drives & (1 << i) != 0 {
@@ -62,23 +67,32 @@ pub fn read_dir(path: &Path, include_hidden: bool) -> ResultType<FileDirectory> 
         }
         return Ok(dir);
     }
-    for entry in path.read_dir()?.flatten() {
+    let entries = path
+        .read_dir()
+        .with_context(|| format!("failed to read directory {}", path.display()))?;
+    collect_directory_entries(path, include_hidden, entries)
+}
+
+fn collect_directory_entries(
+    path: &Path,
+    include_hidden: bool,
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> ResultType<FileDirectory> {
+    let mut dir = FileDirectory {
+        path: get_string(path),
+        ..Default::default()
+    };
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("failed to read an entry in directory {}", path.display()))?;
         let p = entry.path();
-        let name = p
+        let name = entry
             .file_name()
-            .map(|p| p.to_str().unwrap_or(""))
-            .unwrap_or("")
-            .to_owned();
-        if name.is_empty() {
-            continue;
-        }
+            .into_string()
+            .map_err(|_| anyhow!("directory entry name is not valid UTF-8: {}", p.display()))?;
         let mut is_hidden = false;
-        let meta;
-        if let Ok(tmp) = std::fs::symlink_metadata(&p) {
-            meta = tmp;
-        } else {
-            continue;
-        }
+        let meta = std::fs::symlink_metadata(&p)
+            .with_context(|| format!("failed to read metadata for {}", p.display()))?;
         // docs.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
         #[cfg(windows)]
         if meta.file_attributes() & 0x2 != 0 {
@@ -92,28 +106,28 @@ pub fn read_dir(path: &Path, include_hidden: bool) -> ResultType<FileDirectory> 
             continue;
         }
         let (entry_type, size) = {
-            if p.is_dir() {
-                if meta.file_type().is_symlink() {
+            if meta.file_type().is_symlink() {
+                if p.is_dir() {
                     (FileType::DirLink.into(), 0)
                 } else {
-                    (FileType::Dir.into(), 0)
+                    (FileType::FileLink.into(), 0)
                 }
-            } else if meta.file_type().is_symlink() {
-                (FileType::FileLink.into(), 0)
-            } else {
+            } else if meta.is_dir() {
+                (FileType::Dir.into(), 0)
+            } else if meta.is_file() {
                 (FileType::File.into(), meta.len())
+            } else {
+                bail!("unsupported directory entry type: {}", p.display());
             }
         };
         let modified_time = meta
             .modified()
-            .map(|x| {
-                x.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|x| x.as_secs())
-                    .unwrap_or(0)
-            })
+            .with_context(|| format!("failed to read modification time for {}", p.display()))?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|x| x.as_secs())
             .unwrap_or(0);
         dir.entries.push(FileEntry {
-            name: get_file_name(&p),
+            name,
             entry_type,
             is_hidden,
             size,
@@ -153,7 +167,15 @@ fn read_dir_recursive(
     include_hidden: bool,
 ) -> ResultType<Vec<FileEntry>> {
     let mut files = Vec::new();
-    if path.is_dir() {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "recursive listing root is a symbolic link: {}",
+            path.display()
+        );
+    }
+    if metadata.is_dir() {
         // to-do: symbol link handling, cp the link rather than the content
         // to-do: file mode, for unix
         let fd = read_dir(path, include_hidden)?;
@@ -165,44 +187,33 @@ fn read_dir_recursive(
                     files.push(entry);
                 }
                 Ok(FileType::Dir) => {
-                    if let Ok(mut tmp) = read_dir_recursive(
+                    let mut tmp = read_dir_recursive(
                         &path.join(&entry.name),
                         &prefix.join(&entry.name),
                         include_hidden,
-                    ) {
-                        for entry in tmp.drain(0..) {
-                            files.push(entry);
-                        }
-                    }
+                    )?;
+                    files.append(&mut tmp);
                 }
                 _ => {}
             }
         }
         Ok(files)
-    } else if path.is_file() {
-        let (size, modified_time) = if let Ok(meta) = std::fs::metadata(path) {
-            (
-                meta.len(),
-                meta.modified()
-                    .map(|x| {
-                        x.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map(|x| x.as_secs())
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0),
-            )
-        } else {
-            (0, 0)
-        };
+    } else if metadata.is_file() {
+        let modified_time = metadata
+            .modified()
+            .with_context(|| format!("failed to read modification time for {}", path.display()))?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|x| x.as_secs())
+            .unwrap_or(0);
         files.push(FileEntry {
             entry_type: FileType::File.into(),
-            size,
+            size: metadata.len(),
             modified_time,
             ..Default::default()
         });
         Ok(files)
     } else {
-        bail!("Not exists");
+        bail!("unsupported recursive listing path: {}", path.display());
     }
 }
 
@@ -216,7 +227,15 @@ fn read_empty_dirs_recursive(
     include_hidden: bool,
 ) -> ResultType<Vec<FileDirectory>> {
     let mut dirs = Vec::new();
-    if path.is_dir() {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "recursive listing root is a symbolic link: {}",
+            path.display()
+        );
+    }
+    if metadata.is_dir() {
         // to-do: symbol link handling, cp the link rather than the content
         // to-do: file mode, for unix
         let fd = read_dir(path, include_hidden)?;
@@ -225,23 +244,20 @@ fn read_empty_dirs_recursive(
         } else {
             for entry in fd.entries.iter() {
                 if let Ok(FileType::Dir) = entry.entry_type.enum_value() {
-                    if let Ok(mut tmp) = read_empty_dirs_recursive(
+                    let mut tmp = read_empty_dirs_recursive(
                         &path.join(&entry.name),
                         &prefix.join(&entry.name),
                         include_hidden,
-                    ) {
-                        for entry in tmp.drain(0..) {
-                            dirs.push(entry);
-                        }
-                    }
+                    )?;
+                    dirs.append(&mut tmp);
                 }
             }
         }
         Ok(dirs)
-    } else if path.is_file() {
+    } else if metadata.is_file() {
         Ok(dirs)
     } else {
-        bail!("Not exists");
+        bail!("unsupported recursive listing path: {}", path.display());
     }
 }
 
@@ -1874,11 +1890,38 @@ impl TransferJob {
 
 #[inline]
 pub fn new_error<T: std::string::ToString>(id: i32, err: T, file_num: i32) -> Message {
+    new_file_error(
+        id,
+        err,
+        file_num,
+        String::new(),
+        FileErrorOperation::Transfer,
+    )
+}
+
+#[inline]
+pub fn new_listing_error<T: std::string::ToString>(
+    path: String,
+    err: T,
+    operation: FileErrorOperation,
+) -> Message {
+    new_file_error(0, err, -1, path, operation)
+}
+
+fn new_file_error<T: std::string::ToString>(
+    id: i32,
+    err: T,
+    file_num: i32,
+    path: String,
+    operation: FileErrorOperation,
+) -> Message {
     let mut resp = FileResponse::new();
     resp.set_error(FileTransferError {
         id,
         error: err.to_string(),
         file_num,
+        path,
+        operation: operation.into(),
         ..Default::default()
     });
     let mut msg_out = Message::new();
@@ -2069,21 +2112,97 @@ pub async fn handle_read_jobs(
     Ok(job_log)
 }
 
-pub fn remove_all_empty_dir(path: &Path) -> ResultType<()> {
-    let fd = read_dir(path, true)?;
-    for entry in fd.entries.iter() {
-        match entry.entry_type.enum_value() {
-            Ok(FileType::Dir) => {
-                remove_all_empty_dir(&path.join(&entry.name)).ok();
+fn remove_entry_or_ignore_not_found(
+    path: &Path,
+    remove: impl FnOnce() -> std::io::Result<()>,
+) -> ResultType<()> {
+    match remove() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn remove_open_empty_dir(directory: Dir, path: &Path) -> ResultType<()> {
+    {
+        let entries = directory
+            .entries()
+            .with_context(|| format!("failed to read directory {}", path.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("failed to read an entry in directory {}", path.display())
+            })?;
+            let name = entry.file_name();
+            let entry_path = path.join(&name);
+            let metadata = match directory.symlink_metadata(&name) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to read metadata for {}", entry_path.display())
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                remove_entry_or_ignore_not_found(&entry_path, || {
+                    directory.remove_file_or_symlink(&name)
+                })?;
+            } else if metadata.is_dir() {
+                let child = match directory.open_dir_nofollow(&name) {
+                    Ok(child) => child,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("failed to open directory {}", entry_path.display())
+                        });
+                    }
+                };
+                remove_open_empty_dir(child, &entry_path)?;
             }
-            Ok(FileType::DirLink) | Ok(FileType::FileLink) => {
-                std::fs::remove_file(path.join(&entry.name)).ok();
-            }
-            _ => {}
         }
     }
-    std::fs::remove_dir(path).ok();
-    Ok(())
+    remove_entry_or_ignore_not_found(path, || directory.remove_open_dir())
+}
+
+fn remove_symlink_root(path: &Path) -> ResultType<()> {
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("symbolic link path has no file name: {}", path.display()))?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = open_ambient_directory_nofollow(parent_path, false)
+        .with_context(|| format!("failed to open parent directory for {}", path.display()))?;
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            remove_entry_or_ignore_not_found(path, || parent.remove_file_or_symlink(name))
+        }
+        Ok(_) => bail!(
+            "recursive removal root changed from a symbolic link: {}",
+            path.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read metadata for {}", path.display()))
+        }
+    }
+}
+
+pub fn remove_all_empty_dir(path: &Path) -> ResultType<()> {
+    match open_ambient_directory_nofollow(path, false) {
+        Ok(directory) => remove_open_empty_dir(directory, path),
+        Err(open_err) => match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => remove_symlink_root(path),
+            Ok(_) => Err(open_err)
+                .with_context(|| format!("failed to open directory {}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to read metadata for {}", path.display()))
+            }
+        },
+    }
 }
 
 #[inline]
@@ -2267,6 +2386,31 @@ mod tests {
         assert_eq!(
             peer_info.file_transfer_protocol_version,
             FILE_TRANSFER_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn directory_listing_error_wire_round_trips_operation_and_path() {
+        let message = new_listing_error(
+            "/requested/path".to_owned(),
+            "permission denied",
+            FileErrorOperation::ReadEmptyDirs,
+        );
+        let message = Message::parse_from_bytes(
+            &message
+                .write_to_bytes()
+                .expect("serialize structured directory error"),
+        )
+        .expect("parse structured directory error");
+        let error = message.file_response().error();
+
+        assert_eq!(error.id, 0);
+        assert_eq!(error.file_num, -1);
+        assert_eq!(error.path, "/requested/path");
+        assert_eq!(error.error, "permission denied");
+        assert_eq!(
+            error.operation.enum_value(),
+            Ok(FileErrorOperation::ReadEmptyDirs)
         );
     }
 
@@ -3705,6 +3849,230 @@ mod tests {
 
         assert!(!src.exists());
         assert!(dst.exists());
+    }
+
+    #[test]
+    fn recursive_directory_listing_propagates_entry_iteration_failure() {
+        let tmp_root = TestTempDir::new("camellia_recursive_entry_failure");
+        std::fs::create_dir_all(&tmp_root.path).expect("create listing root");
+        let entries = std::iter::once(Err(std::io::Error::other(
+            "synthetic directory iteration failure",
+        )));
+
+        let err = collect_directory_entries(&tmp_root.path, true, entries)
+            .expect_err("an entry iteration error must fail the complete listing");
+        assert!(
+            err.to_string()
+                .contains(&tmp_root.path.to_string_lossy().to_string()),
+            "the failure must identify the directory being enumerated: {err}"
+        );
+    }
+
+    #[test]
+    fn recursive_directory_listing_propagates_disappeared_entry_path() {
+        let tmp_root = TestTempDir::new("camellia_recursive_disappeared_entry");
+        let disappearing = tmp_root.join("disappearing.txt");
+        std::fs::create_dir_all(&tmp_root.path).expect("create listing root");
+        std::fs::write(&disappearing, b"temporary").expect("create disappearing entry");
+        let entry = std::fs::read_dir(&tmp_root.path)
+            .expect("open listing root")
+            .next()
+            .expect("find disappearing entry")
+            .expect("read disappearing entry");
+        std::fs::remove_file(&disappearing).expect("remove entry before metadata lookup");
+
+        let err = collect_directory_entries(&tmp_root.path, true, std::iter::once(Ok(entry)))
+            .expect_err("a vanished entry must fail the complete listing");
+        assert!(
+            err.to_string().contains("disappearing.txt"),
+            "the failure must identify the vanished entry: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_listing_rejects_special_entry() {
+        let tmp_root = TestTempDir::new("camellia_recursive_special_entry");
+        std::fs::create_dir_all(&tmp_root.path).expect("create listing root");
+        let socket_path = tmp_root.join("service.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("create special directory entry");
+
+        let err = read_dir(&tmp_root.path, true)
+            .expect_err("an unsupported special entry must not be reported as a regular file");
+        assert!(
+            err.to_string().contains("service.sock"),
+            "the failure must identify the unsupported entry: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_listing_propagates_unreadable_child_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_root = TestTempDir::new("camellia_recursive_unreadable_child");
+        let blocked = tmp_root.join("blocked");
+        std::fs::create_dir_all(&blocked).expect("create blocked child directory");
+        std::fs::write(blocked.join("payload.txt"), b"must not disappear")
+            .expect("create child payload");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("make child unreadable");
+
+        let result = get_recursive_files(&tmp_root.path.to_string_lossy(), true);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore child permissions");
+
+        let err = result.expect_err("an unreadable child must fail the complete listing");
+        assert!(
+            err.to_string().contains("blocked"),
+            "the failure must identify the omitted child: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_empty_directory_listing_propagates_unreadable_child_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_root = TestTempDir::new("camellia_recursive_empty_unreadable_child");
+        let blocked = tmp_root.join("blocked");
+        std::fs::create_dir_all(&blocked).expect("create blocked child directory");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("make child unreadable");
+
+        let result = get_empty_dirs_recursive(&tmp_root.path.to_string_lossy(), true);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore child permissions");
+
+        let err = result.expect_err("an unreadable child must fail the complete empty-dir scan");
+        assert!(
+            err.to_string().contains("blocked"),
+            "the failure must identify the omitted child: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_listing_rejects_symlink_root() {
+        let tmp_root = TestTempDir::new("camellia_recursive_symlink_root");
+        let target = tmp_root.join("target");
+        let link = tmp_root.join("root-link");
+        std::fs::create_dir_all(&target).expect("create symlink target directory");
+        create_test_dir_symlink(&target, &link).expect("create recursive root symlink");
+
+        let files_err = get_recursive_files(&link.to_string_lossy(), true)
+            .expect_err("recursive file listing must reject a symlink root");
+        assert!(files_err.to_string().contains("root-link"));
+
+        let dirs_err = get_empty_dirs_recursive(&link.to_string_lossy(), true)
+            .expect_err("recursive empty-dir listing must reject a symlink root");
+        assert!(dirs_err.to_string().contains("root-link"));
+    }
+
+    #[test]
+    fn recursive_empty_directory_removal_is_idempotent_for_not_found() {
+        let missing = unique_temp_dir("camellia_remove_missing_empty_tree");
+        assert!(!missing.exists());
+        remove_all_empty_dir(&missing).expect("an already absent tree is an idempotent success");
+    }
+
+    #[test]
+    fn recursive_empty_directory_removal_removes_valid_tree() {
+        let tmp_root = TestTempDir::new("camellia_remove_valid_empty_tree");
+        std::fs::create_dir_all(tmp_root.join("one/two/three")).expect("create nested empty tree");
+
+        remove_all_empty_dir(&tmp_root.path).expect("remove a valid empty tree");
+        assert!(!tmp_root.path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_empty_directory_removal_unlinks_symlink_without_following_target() {
+        let tmp_root = TestTempDir::new("camellia_remove_directory_symlink");
+        let removal_root = tmp_root.join("removal-root");
+        let outside = tmp_root.join("outside");
+        let sentinel = outside.join("sentinel.txt");
+        std::fs::create_dir_all(&removal_root).expect("create removal root");
+        std::fs::create_dir_all(&outside).expect("create symlink target");
+        std::fs::write(&sentinel, b"outside must remain").expect("create outside sentinel");
+        create_test_dir_symlink(&outside, &removal_root.join("outside-link"))
+            .expect("create child directory symlink");
+
+        remove_all_empty_dir(&removal_root).expect("unlink symlink and remove empty root");
+        assert!(!removal_root.exists());
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read outside sentinel"),
+            b"outside must remain"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_empty_directory_removal_unlinks_symlink_root_without_following_target() {
+        let tmp_root = TestTempDir::new("camellia_remove_root_symlink");
+        let target = tmp_root.join("target");
+        let target_empty_child = target.join("empty-child");
+        let sentinel = target.join("sentinel.txt");
+        let link = tmp_root.join("root-link");
+        std::fs::create_dir_all(&target_empty_child).expect("create target empty child");
+        std::fs::write(&sentinel, b"target must remain").expect("create target sentinel");
+        create_test_dir_symlink(&target, &link).expect("create removal root symlink");
+
+        remove_all_empty_dir(&link).expect("unlink the root symlink without traversing it");
+        assert!(!link.is_symlink());
+        assert!(target_empty_child.is_dir());
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read target sentinel"),
+            b"target must remain"
+        );
+    }
+
+    #[test]
+    fn recursive_empty_directory_removal_reports_non_empty_child() {
+        let tmp_root = TestTempDir::new("camellia_remove_non_empty_child");
+        let nested = tmp_root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        std::fs::write(nested.join("payload.txt"), b"must remain").expect("create nested payload");
+
+        let err = remove_all_empty_dir(&tmp_root.path)
+            .expect_err("a non-empty child must prevent an overall success result");
+        assert!(nested.join("payload.txt").is_file());
+        assert!(
+            err.to_string().contains("nested"),
+            "the failure must identify the directory that remained: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_empty_directory_removal_propagates_symlink_unlink_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_root = TestTempDir::new("camellia_remove_symlink_failure");
+        let outside = tmp_root.path.with_extension("outside");
+        std::fs::write(&outside, b"outside must remain").expect("create outside target");
+        std::fs::create_dir_all(&tmp_root.path).expect("create removal root");
+        let link = tmp_root.join("outside-link");
+        create_test_file_symlink(&outside, &link).expect("create child symlink");
+        std::fs::set_permissions(&tmp_root.path, std::fs::Permissions::from_mode(0o500))
+            .expect("make removal root non-writable");
+
+        let result = remove_all_empty_dir(&tmp_root.path);
+        std::fs::set_permissions(&tmp_root.path, std::fs::Permissions::from_mode(0o700))
+            .expect("restore removal root permissions");
+
+        let err = result.expect_err("a failed symlink unlink must prevent overall success");
+        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside target"),
+            b"outside must remain"
+        );
+        assert!(
+            err.to_string().contains("outside-link"),
+            "the failure must identify the symlink that remained: {err}"
+        );
+        std::fs::remove_file(outside).expect("remove outside target");
     }
 
     #[cfg(windows)]
