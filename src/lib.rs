@@ -504,6 +504,44 @@ pub fn time_based_rand() -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use protobuf::Message as _;
+
+    #[test]
+    fn clipboard_file_contents_wire_preserves_native_unsigned_fields() {
+        let request = message_proto::CliprdrFileContentsRequest {
+            stream_id: u32::MAX,
+            list_index: u32::MAX - 1,
+            dw_flags: 2,
+            n_position_low: u32::MAX,
+            n_position_high: u32::MAX,
+            cb_requested: u32::MAX,
+            have_clip_data_id: true,
+            clip_data_id: u32::MAX - 2,
+            ..Default::default()
+        };
+        let encoded = request.write_to_bytes().unwrap();
+        let decoded =
+            message_proto::CliprdrFileContentsRequest::parse_from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.stream_id, u32::MAX);
+        assert_eq!(decoded.list_index, u32::MAX - 1);
+        assert_eq!(decoded.n_position_low, u32::MAX);
+        assert_eq!(decoded.n_position_high, u32::MAX);
+        assert_eq!(decoded.cb_requested, u32::MAX);
+        assert_eq!(decoded.clip_data_id, u32::MAX - 2);
+
+        let response = message_proto::CliprdrFileContentsResponse {
+            msg_flags: u32::MAX,
+            stream_id: u32::MAX - 3,
+            requested_data: vec![1, 2, 3].into(),
+            ..Default::default()
+        };
+        let encoded = response.write_to_bytes().unwrap();
+        let decoded =
+            message_proto::CliprdrFileContentsResponse::parse_from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.msg_flags, u32::MAX);
+        assert_eq!(decoded.stream_id, u32::MAX - 3);
+        assert_eq!(decoded.requested_data.as_ref(), &[1, 2, 3]);
+    }
 
     #[test]
     fn test_mangle() {
