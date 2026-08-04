@@ -2567,18 +2567,24 @@ impl Ab {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                log::error!("ab data too large, {} > {}", data.len(), max_len);
+        let data = match compress(json.as_bytes()) {
+            Ok(data) => data,
+            Err(err) => {
+                log::error!("failed to compress address book data: {err}");
                 return;
             }
-            if let Ok(data) = encrypt_local(&data) {
+        };
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            log::error!("ab data too large, {} > {}", data.len(), max_len);
+            return;
+        }
+        if let Ok(data) = encrypt_local(&data) {
+            if let Ok(mut file) = std::fs::File::create(Self::path()) {
                 file.write_all(&data).ok();
             }
-        };
+        }
     }
 
     pub fn load() -> Ab {
@@ -2586,9 +2592,11 @@ impl Ab {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
                 if let Ok(data) = decrypt_local(&data) {
-                    let data = decompress(&data);
-                    if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
-                        return ab;
+                    if let Ok(data) = decompress(&data) {
+                        if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data))
+                        {
+                            return ab;
+                        }
                     }
                 }
             }
@@ -2697,17 +2705,23 @@ impl Group {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
+        let data = match compress(json.as_bytes()) {
+            Ok(data) => data,
+            Err(err) => {
+                log::error!("failed to compress group data: {err}");
                 return;
             }
-            if let Ok(data) = encrypt_local(&data) {
+        };
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            return;
+        }
+        if let Ok(data) = encrypt_local(&data) {
+            if let Ok(mut file) = std::fs::File::create(Self::path()) {
                 file.write_all(&data).ok();
             }
-        };
+        }
     }
 
     pub fn load() -> Self {
@@ -2715,10 +2729,12 @@ impl Group {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
                 if let Ok(data) = decrypt_local(&data) {
-                    let data = decompress(&data);
-                    if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
-                    {
-                        return group;
+                    if let Ok(data) = decompress(&data) {
+                        if let Ok(group) =
+                            serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
+                        {
+                            return group;
+                        }
                     }
                 }
             }

@@ -88,6 +88,7 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  uint32 file_transfer_protocol_version = 18;
 }
 
 message Terminal {
@@ -137,6 +138,7 @@ message PeerInfo {
   // NOTE: Only support one-level dictionaries (for peer to update), and the key is of type string.
   string platform_additions = 12;
   WindowsSessions windows_sessions = 13;
+  uint32 file_transfer_protocol_version = 14;
 }
 
 message WindowsSession {
@@ -477,7 +479,7 @@ message FileTransferSendConfirmRequest {
   sint32 file_num = 2;
   oneof union {
     bool skip = 3;
-    uint32 offset_blk = 4;
+    uint64 offset_bytes = 4;
   }
 }
 
