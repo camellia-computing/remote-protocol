@@ -211,6 +211,8 @@ enum ErrorCode {
   DESKTOP_NOT_FOUND = 24;
   DESKTOP_SESSION_PASSWORD_REQUIRED = 25;
   DESKTOP_SESSION_PASSWORD_INVALID = 26;
+  RATE_LIMITED = 27;
+  SERVICE_BUSY = 28;
 }
 
 message TouchScaleUpdate {
@@ -1012,7 +1014,9 @@ message TerminalClosed {
 
 message TerminalError {
   int32 terminal_id = 1;
+  // Deprecated: consumers must use typed_error.
   string message = 2;
+  ErrorEnvelope typed_error = 3;
 }
 
 message TerminalResponse {

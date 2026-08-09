@@ -106,6 +106,8 @@ pub fn for_code(code: ErrorCode) -> ErrorEnvelope {
         ErrorCode::DESKTOP_SESSION_PASSWORD_INVALID => {
             (AUTHENTICATION, true, "desktop_session_password_invalid")
         }
+        ErrorCode::RATE_LIMITED => (NETWORK, true, "rate_limited"),
+        ErrorCode::SERVICE_BUSY => (NETWORK, true, "service_busy"),
         ErrorCode::INTERNAL_FAILURE | ErrorCode::ERROR_CODE_UNSPECIFIED => {
             (INTERNAL, false, "internal_failure")
         }
@@ -116,6 +118,8 @@ pub fn for_code(code: ErrorCode) -> ErrorEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protobuf::{Enum as _, Message as _};
+    use std::collections::HashSet;
 
     #[test]
     fn envelope_is_versioned_and_bounded() {
@@ -160,5 +164,44 @@ mod tests {
         let mut error = for_code(ErrorCode::PASSWORD_INVALID);
         error.display_key = "Wrong Password".to_owned();
         assert!(!is_valid(&error));
+
+        let mut error = for_code(ErrorCode::PASSWORD_INVALID);
+        error.category = ErrorCategory::NETWORK.into();
+        assert!(!is_valid(&error));
+
+        let mut error = for_code(ErrorCode::PASSWORD_INVALID);
+        error.correlation_id = "trace\nforged".to_owned();
+        assert!(!is_valid(&error));
+    }
+
+    #[test]
+    fn every_registered_code_has_a_unique_valid_round_trip_contract() {
+        let mut numeric_codes = HashSet::new();
+        let mut display_keys = HashSet::new();
+
+        for &code in ErrorCode::VALUES {
+            assert!(
+                numeric_codes.insert(code.value()),
+                "duplicate code {code:?}"
+            );
+            let error = for_code(code);
+
+            if code == ErrorCode::ERROR_CODE_UNSPECIFIED {
+                assert!(!is_valid(&error));
+                continue;
+            }
+
+            assert!(is_valid(&error), "invalid defaults for {code:?}");
+            assert!(
+                display_keys.insert(error.display_key.clone()),
+                "duplicate display key for {code:?}"
+            );
+            let encoded = error.write_to_bytes().expect("encode error envelope");
+            let decoded = ErrorEnvelope::parse_from_bytes(&encoded).expect("decode error envelope");
+            assert_eq!(decoded, error, "wire drift for {code:?}");
+            assert!(is_valid(&decoded), "invalid decoded envelope for {code:?}");
+        }
+
+        assert_eq!(display_keys.len() + 1, ErrorCode::VALUES.len());
     }
 }
