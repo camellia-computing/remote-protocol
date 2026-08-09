@@ -10,6 +10,15 @@ pub const ERROR_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ERROR_DETAILS_BYTES: usize = 1024;
 pub const MAX_CORRELATION_ID_BYTES: usize = 128;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorContext {
+    Login,
+    FileTransfer,
+    Close,
+    HttpProxy,
+    Terminal,
+}
+
 pub fn envelope(
     category: ErrorCategory,
     code: ErrorCode,
@@ -68,6 +77,72 @@ pub fn is_valid(error: &ErrorEnvelope) -> bool {
         && !error.display_key.chars().any(char::is_control)
         && !error.details.chars().any(char::is_control)
         && !error.correlation_id.chars().any(char::is_control)
+}
+
+/// Validate both the envelope and the message domain carrying it. A globally
+/// registered code is not automatically meaningful in every protobuf field.
+pub fn is_valid_for(error: &ErrorEnvelope, context: ErrorContext) -> bool {
+    if !is_valid(error) {
+        return false;
+    }
+    let Ok(code) = error.code.enum_value() else {
+        return false;
+    };
+    match context {
+        ErrorContext::Login => !matches!(
+            code,
+            ErrorCode::FILE_OPERATION_FAILED | ErrorCode::HTTP_PROXY_FAILED
+        ),
+        ErrorContext::FileTransfer => matches!(
+            code,
+            ErrorCode::CONNECTION_TIMEOUT
+                | ErrorCode::CONNECTION_RESET
+                | ErrorCode::CONNECTION_CLOSED
+                | ErrorCode::PERMISSION_DENIED
+                | ErrorCode::CONFLICT
+                | ErrorCode::CANCELLED
+                | ErrorCode::NOT_FOUND
+                | ErrorCode::FILE_OPERATION_FAILED
+                | ErrorCode::PROTOCOL_MISMATCH
+                | ErrorCode::INTERNAL_FAILURE
+        ),
+        ErrorContext::Close => matches!(
+            code,
+            ErrorCode::CONNECTION_OFFLINE
+                | ErrorCode::CONNECTION_TIMEOUT
+                | ErrorCode::CONNECTION_RESET
+                | ErrorCode::CONNECTION_CLOSED
+                | ErrorCode::PERMISSION_DENIED
+                | ErrorCode::CONFLICT
+                | ErrorCode::CANCELLED
+                | ErrorCode::PROTOCOL_MISMATCH
+                | ErrorCode::INTERNAL_FAILURE
+        ),
+        ErrorContext::HttpProxy => matches!(
+            code,
+            ErrorCode::CONNECTION_OFFLINE
+                | ErrorCode::CONNECTION_TIMEOUT
+                | ErrorCode::CONNECTION_RESET
+                | ErrorCode::CONNECTION_CLOSED
+                | ErrorCode::PERMISSION_DENIED
+                | ErrorCode::HTTP_PROXY_FAILED
+                | ErrorCode::PROTOCOL_MISMATCH
+                | ErrorCode::INTERNAL_FAILURE
+                | ErrorCode::RATE_LIMITED
+                | ErrorCode::SERVICE_BUSY
+        ),
+        ErrorContext::Terminal => matches!(
+            code,
+            ErrorCode::CONNECTION_CLOSED
+                | ErrorCode::PERMISSION_DENIED
+                | ErrorCode::CONFLICT
+                | ErrorCode::CANCELLED
+                | ErrorCode::NOT_FOUND
+                | ErrorCode::PROTOCOL_MISMATCH
+                | ErrorCode::INTERNAL_FAILURE
+                | ErrorCode::SERVICE_BUSY
+        ),
+    }
 }
 
 /// Convert a stable error code to its contract defaults. Producers may add
@@ -203,5 +278,33 @@ mod tests {
         }
 
         assert_eq!(display_keys.len() + 1, ErrorCode::VALUES.len());
+    }
+
+    #[test]
+    fn rejects_registered_codes_in_the_wrong_message_domain() {
+        assert!(is_valid_for(
+            &for_code(ErrorCode::PASSWORD_INVALID),
+            ErrorContext::Login
+        ));
+        assert!(!is_valid_for(
+            &for_code(ErrorCode::FILE_OPERATION_FAILED),
+            ErrorContext::Login
+        ));
+        assert!(is_valid_for(
+            &for_code(ErrorCode::FILE_OPERATION_FAILED),
+            ErrorContext::FileTransfer
+        ));
+        assert!(!is_valid_for(
+            &for_code(ErrorCode::HTTP_PROXY_FAILED),
+            ErrorContext::FileTransfer
+        ));
+        assert!(is_valid_for(
+            &for_code(ErrorCode::RATE_LIMITED),
+            ErrorContext::HttpProxy
+        ));
+        assert!(!is_valid_for(
+            &for_code(ErrorCode::PASSWORD_REQUIRED),
+            ErrorContext::HttpProxy
+        ));
     }
 }
