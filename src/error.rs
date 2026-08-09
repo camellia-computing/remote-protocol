@@ -51,9 +51,17 @@ pub fn bounded(value: &str, max_bytes: usize) -> String {
 }
 
 pub fn is_valid(error: &ErrorEnvelope) -> bool {
+    let Ok(code) = error.code.enum_value() else {
+        return false;
+    };
+    if code == ErrorCode::ERROR_CODE_UNSPECIFIED {
+        return false;
+    }
+    let canonical = for_code(code);
     error.schema_version == ERROR_SCHEMA_VERSION
-        && error.category != ErrorCategory::ERROR_CATEGORY_UNSPECIFIED.into()
-        && error.code != ErrorCode::ERROR_CODE_UNSPECIFIED.into()
+        && error.category == canonical.category
+        && error.retryable == canonical.retryable
+        && error.display_key == canonical.display_key
         && error.display_key.len() <= 128
         && error.details.len() <= MAX_ERROR_DETAILS_BYTES
         && error.correlation_id.len() <= MAX_CORRELATION_ID_BYTES
@@ -130,17 +138,27 @@ mod tests {
 
     #[test]
     fn rejects_unknown_version_and_control_data() {
-        let mut error = envelope(
-            ErrorCategory::AUTHENTICATION,
-            ErrorCode::PASSWORD_INVALID,
-            false,
-            "password_invalid",
-        );
+        let mut error = for_code(ErrorCode::PASSWORD_INVALID);
         assert!(is_valid(&error));
         error.schema_version += 1;
         assert!(!is_valid(&error));
         error.schema_version = ERROR_SCHEMA_VERSION;
         error.display_key.push('\n');
+        assert!(!is_valid(&error));
+    }
+
+    #[test]
+    fn rejects_unknown_code_and_semantic_tampering() {
+        let mut error = for_code(ErrorCode::CONNECTION_TIMEOUT);
+        error.code = protobuf::EnumOrUnknown::from_i32(99_999);
+        assert!(!is_valid(&error));
+
+        let mut error = for_code(ErrorCode::CONNECTION_TIMEOUT);
+        error.retryable = false;
+        assert!(!is_valid(&error));
+
+        let mut error = for_code(ErrorCode::PASSWORD_INVALID);
+        error.display_key = "Wrong Password".to_owned();
         assert!(!is_valid(&error));
     }
 }
