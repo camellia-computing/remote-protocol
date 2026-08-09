@@ -62,6 +62,36 @@ pub fn is_valid(error: &ErrorEnvelope) -> bool {
         && !error.correlation_id.chars().any(char::is_control)
 }
 
+/// Convert a stable error code to its contract defaults. Producers may add
+/// bounded details/correlation after calling this helper.
+pub fn for_code(code: ErrorCode) -> ErrorEnvelope {
+    use ErrorCategory::*;
+    let (category, retryable, display_key) = match code {
+        ErrorCode::PASSWORD_REQUIRED => (AUTHENTICATION, true, "password_required"),
+        ErrorCode::PASSWORD_INVALID => (AUTHENTICATION, true, "password_invalid"),
+        ErrorCode::TWO_FACTOR_REQUIRED => (AUTHENTICATION, true, "two_factor_required"),
+        ErrorCode::TWO_FACTOR_INVALID => (AUTHENTICATION, true, "two_factor_invalid"),
+        ErrorCode::NO_PASSWORD_ACCESS => (AUTHORIZATION, true, "no_password_access"),
+        ErrorCode::WAYLAND_UNSUPPORTED => (PLATFORM, true, "wayland_unsupported"),
+        ErrorCode::DISPLAY_SERVER_UNSUPPORTED => (PLATFORM, true, "display_server_unsupported"),
+        ErrorCode::CONNECTION_OFFLINE => (NETWORK, false, "connection_offline"),
+        ErrorCode::CONNECTION_TIMEOUT => (NETWORK, true, "connection_timeout"),
+        ErrorCode::CONNECTION_RESET => (NETWORK, true, "connection_reset"),
+        ErrorCode::CONNECTION_CLOSED => (NETWORK, false, "connection_closed"),
+        ErrorCode::PERMISSION_DENIED => (AUTHORIZATION, false, "permission_denied"),
+        ErrorCode::CONFLICT => (STATE, false, "conflict"),
+        ErrorCode::CANCELLED => (STATE, false, "cancelled"),
+        ErrorCode::NOT_FOUND => (STATE, false, "not_found"),
+        ErrorCode::FILE_OPERATION_FAILED => (FILE_TRANSFER, false, "file_operation_failed"),
+        ErrorCode::HTTP_PROXY_FAILED => (NETWORK, true, "http_proxy_failed"),
+        ErrorCode::PROTOCOL_MISMATCH => (PROTOCOL, false, "protocol_mismatch"),
+        ErrorCode::INTERNAL_FAILURE | ErrorCode::ERROR_CODE_UNSPECIFIED => {
+            (INTERNAL, false, "internal_failure")
+        }
+    };
+    envelope(category, code, retryable, display_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
