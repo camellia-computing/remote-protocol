@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod crypto;
+pub mod error;
 pub mod platform;
 pub mod protos;
 pub use bytes;
