@@ -85,6 +85,19 @@ pub fn for_code(code: ErrorCode) -> ErrorEnvelope {
         ErrorCode::FILE_OPERATION_FAILED => (FILE_TRANSFER, false, "file_operation_failed"),
         ErrorCode::HTTP_PROXY_FAILED => (NETWORK, true, "http_proxy_failed"),
         ErrorCode::PROTOCOL_MISMATCH => (PROTOCOL, false, "protocol_mismatch"),
+        ErrorCode::DESKTOP_SESSION_NOT_READY => (PLATFORM, true, "desktop_session_not_ready"),
+        ErrorCode::DESKTOP_XSESSION_FAILED => (PLATFORM, true, "desktop_xsession_failed"),
+        ErrorCode::DESKTOP_SESSION_ANOTHER_USER => {
+            (PLATFORM, false, "desktop_session_another_user")
+        }
+        ErrorCode::DESKTOP_XORG_NOT_FOUND => (PLATFORM, true, "desktop_xorg_not_found"),
+        ErrorCode::DESKTOP_NOT_FOUND => (PLATFORM, true, "desktop_no_desktop"),
+        ErrorCode::DESKTOP_SESSION_PASSWORD_REQUIRED => {
+            (AUTHENTICATION, true, "desktop_session_password_required")
+        }
+        ErrorCode::DESKTOP_SESSION_PASSWORD_INVALID => {
+            (AUTHENTICATION, true, "desktop_session_password_invalid")
+        }
         ErrorCode::INTERNAL_FAILURE | ErrorCode::ERROR_CODE_UNSPECIFIED => {
             (INTERNAL, false, "internal_failure")
         }
