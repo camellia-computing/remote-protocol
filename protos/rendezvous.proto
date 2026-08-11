@@ -1,6 +1,8 @@
 syntax = "proto3";
 package hbb;
 
+import "message.proto";
+
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
@@ -244,7 +246,9 @@ message HttpProxyResponse {
   int32 status = 1;
   repeated HeaderEntry headers = 2;
   bytes body = 3;
+  // Deprecated: consumers must use typed_error.
   string error = 4;
+  ErrorEnvelope typed_error = 5;
 }
 
 message RendezvousMessage {
