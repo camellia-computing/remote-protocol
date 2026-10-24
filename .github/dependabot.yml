@@ -4,9 +4,20 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-compatible:
+        patterns: ["*"]
+        update-types: [minor, patch]
     open-pull-requests-limit: 5
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      workflow-actions:
+        patterns: ["*"]
     open-pull-requests-limit: 5
