@@ -43,4 +43,17 @@ Git dependency graph rather than silently resolving a newer graph. The required
 CI gate also compiles Apple-specific code on a hosted macOS runner so conditional
 platform implementations cannot bypass review.
 
+Dependency updates include the public re-exports consumed by both runtimes. Update
+their call sites and pinned source together: `rand` exposes `RngExt` and fallible
+`SysRng`, while the cryptographic wrappers use the OS entropy interface supplied by
+their reviewed NaCl dependencies. Stable `crypto_box` and `crypto_secretbox` still
+require that `rand_core` generation; do not select their prerelease replacements or
+change ciphertext layouts merely to eliminate a second trait version. Reconsider
+the constraint when stable NaCl releases support the current traits, then rerun
+reference vectors, configuration roundtrips, and both native consumers.
+
+The exact `libc` constraint preserves the required `sysinfo` fork's iOS network
+API. Remove it only when a supported implementation also preserves the fork's
+Linux process enumeration and file-descriptor behavior and passes Apple linking.
+
 See `SOURCE_PROVENANCE.json`, `NOTICE`, and `LICENSE` for origin and licensing information.
