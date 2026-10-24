@@ -6,7 +6,7 @@ use crate::{
     protobuf::Message,
     socket_client::split_host_port,
     tcp::Encrypt,
-    tls::{get_cached_tls_type, upsert_tls_cache, TlsType},
+    tls::TlsType,
     ResultType,
 };
 use anyhow::bail;
@@ -58,8 +58,7 @@ impl WsFramedStream {
     ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         // to-do: websocket proxy.
 
-        let tls_type = get_cached_tls_type(url);
-        let tls_type = tls_type.unwrap_or(TlsType::Rustls);
+        let tls_type = TlsType::for_url(url)?;
         Self::try_connect(url, ms_timeout, tls_type).await
     }
 
@@ -78,10 +77,7 @@ impl WsFramedStream {
         )
         .await?
         {
-            Ok((ws_stream, _)) => {
-                upsert_tls_cache(url, tls_type);
-                Ok(ws_stream)
-            }
+            Ok((ws_stream, _)) => Ok(ws_stream),
             Err(e) => {
                 log::error!(
                     "WebSocket connection failed with tls_type {:?}: {}, {:?}",

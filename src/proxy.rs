@@ -18,7 +18,6 @@ use crate::{
     bytes_codec::BytesCodec,
     config::Socks5Server,
     tcp::{DynTcpStream, FramedStream},
-    tls::{get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
 
@@ -487,18 +486,9 @@ impl Proxy {
                 let authority = connect_authority
                     .as_ref()
                     .ok_or(ProxyError::InvalidTargetAuthority)?;
-                let url = format!("https://{}", self.intercept.get_host_and_port()?);
-                let tls_type = get_cached_tls_type(&url);
-                let stream = match tls_type.unwrap_or(TlsType::Rustls) {
-                    TlsType::Rustls => {
-                        self.https_connect_rustls_wrap(&url, local, proxy, Some(stream), authority)
-                            .await?
-                    }
-                    _ => {
-                        // Unreachable
-                        crate::bail!("Unreachable, TlsType::Plain in HTTPS proxy");
-                    }
-                };
+                let stream = self
+                    .https_connect_rustls_wrap(local, proxy, Some(stream), authority)
+                    .await?;
                 Ok(FramedStream(
                     Framed::new(stream, BytesCodec::for_session()),
                     addr,
@@ -538,7 +528,6 @@ impl Proxy {
 
     async fn https_connect_rustls_wrap(
         &self,
-        url: &str,
         local: SocketAddr,
         proxy: SocketAddr,
         stream: Option<tokio::net::TcpStream>,
@@ -551,10 +540,7 @@ impl Proxy {
         )
         .await?
         {
-            Ok(s) => {
-                upsert_tls_cache(url, TlsType::Rustls);
-                Ok(DynTcpStream(Box::new(s)))
-            }
+            Ok(s) => Ok(DynTcpStream(Box::new(s))),
             Err(e) => {
                 log::error!(
                     "Failed to connect to HTTPS proxy server with rustls-tls: {:?}.",
