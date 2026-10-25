@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
@@ -1236,8 +1236,8 @@ impl Config {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             return Some(
-                rand::thread_rng()
-                    .gen_range(1_000_000_000..2_000_000_000)
+                rand::rng()
+                    .random_range(1_000_000_000..2_000_000_000)
                     .to_string(),
             );
         }
@@ -1267,9 +1267,9 @@ impl Config {
     }
 
     fn get_auto_password_with_chars(length: usize, chars: &[char]) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..length)
-            .map(|_| chars[rng.gen::<usize>() % chars.len()])
+            .map(|_| chars[rng.random_range(0..chars.len())])
             .collect()
     }
 
@@ -1525,8 +1525,8 @@ impl Config {
     pub fn update_id() {
         // to-do: how about if one ip register a lot of ids?
         let id = Self::get_id();
-        let mut rng = rand::thread_rng();
-        let new_id = rng.gen_range(1_000_000_000..2_000_000_000).to_string();
+        let mut rng = rand::rng();
+        let new_id = rng.random_range(1_000_000_000..2_000_000_000).to_string();
         Config::set_id(&new_id);
         log::info!("id updated from {} to {}", id, new_id);
     }
@@ -3898,6 +3898,34 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn generated_passwords_preserve_length_and_alphabet() {
+        for length in [0, 1, 6, 32, 256] {
+            let password = Config::get_auto_password(length);
+            assert_eq!(password.chars().count(), length);
+            assert!(password.chars().all(|value| CHARS.contains(&value)));
+            let numeric = Config::get_auto_numeric_password(length);
+            assert_eq!(numeric.chars().count(), length);
+            assert!(numeric.chars().all(|value| NUM_CHARS.contains(&value)));
+        }
+    }
+
+    #[test]
+    fn toml_roundtrip_preserves_peer_options_and_escaped_values() {
+        let mut config = PeerConfig::default();
+        config.options.insert("empty".into(), String::new());
+        config
+            .options
+            .insert("quoted.key".into(), "line\n\"value\"".into());
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        let decoded: PeerConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.options, config.options);
+        assert_eq!(
+            toml::from_str::<toml::Value>(&encoded).unwrap(),
+            toml::Value::try_from(&decoded).unwrap()
+        );
     }
 
     #[test]

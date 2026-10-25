@@ -375,7 +375,7 @@ pub fn get_uuid() -> Vec<u8> {
             }
             Err(e) => {
                 if LOG_COUNT
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                         (count < 30).then_some(count + 1)
                     })
                     .is_ok()

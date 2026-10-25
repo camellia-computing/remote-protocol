@@ -13,11 +13,11 @@ pub enum CryptoError {
 
 pub mod secretbox {
     use super::CryptoError;
+    use crypto_secretbox::aead::rand_core::{OsRng, RngCore};
     use crypto_secretbox::{
         aead::{Aead, KeyInit},
         XSalsa20Poly1305,
     };
-    use rand::{rngs::OsRng, RngCore};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     pub const KEYBYTES: usize = 32;
@@ -59,10 +59,10 @@ pub mod secretbox {
 
 pub mod box_ {
     use super::CryptoError;
+    use crypto_box::aead::rand_core::{OsRng, RngCore};
     use crypto_box::{
         aead::Aead, PublicKey as RustCryptoPublicKey, SalsaBox, SecretKey as RustCryptoSecretKey,
     };
-    use rand::{rngs::OsRng, RngCore};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     pub const PUBLICKEYBYTES: usize = 32;
@@ -139,8 +139,8 @@ pub mod box_ {
 
 pub mod sign {
     use super::CryptoError;
+    use crypto_box::aead::rand_core::{OsRng, RngCore};
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-    use rand::{rngs::OsRng, RngCore};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     pub const PUBLICKEYBYTES: usize = 32;
