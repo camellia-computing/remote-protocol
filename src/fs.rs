@@ -85,12 +85,27 @@ fn collect_directory_entries(
     for entry in entries {
         let entry = entry
             .with_context(|| format!("failed to read an entry in directory {}", path.display()))?;
-        let p = entry.path();
         let name = entry
             .file_name()
             .into_string()
-            .map_err(|_| anyhow!("directory entry name is not valid UTF-8: {}", p.display()))?;
+            .map_err(|_| anyhow!("directory entry name is not valid UTF-8"))?;
+        // A native directory entry is a single leaf, not a second authority
+        // selected through DirEntry::path(). Keep that invariant explicit.
+        let mut components = Path::new(&name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            bail!("directory entry name is not a single path component");
+        }
+        let p = path.join(&name);
         let mut is_hidden = false;
+        // Windows DirEntry caches enumeration metadata. Preserve a fresh lookup
+        // there so a vanished entry still fails the complete listing.
+        #[cfg(not(windows))]
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {}", p.display()))?;
+        #[cfg(windows)]
         let meta = std::fs::symlink_metadata(&p)
             .with_context(|| format!("failed to read metadata for {}", p.display()))?;
         // docs.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
@@ -2416,32 +2431,24 @@ mod tests {
 
     struct TestTempDir {
         path: PathBuf,
+        _owner: tempfile::TempDir,
     }
 
     impl TestTempDir {
         fn new(prefix: &str) -> Self {
+            let owner = tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir()
+                .expect("create owned test directory");
             Self {
-                path: unique_temp_dir(prefix),
+                path: owner.path().to_path_buf(),
+                _owner: owner,
             }
         }
 
         fn join(&self, path: &str) -> PathBuf {
             self.path.join(path)
         }
-    }
-
-    impl Drop for TestTempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), timestamp))
     }
 
     fn new_file_entry(name: &str) -> FileEntry {
@@ -3972,7 +3979,8 @@ mod tests {
 
     #[test]
     fn recursive_empty_directory_removal_is_idempotent_for_not_found() {
-        let missing = unique_temp_dir("camellia_remove_missing_empty_tree");
+        let owner = TestTempDir::new("camellia_remove_missing_empty_tree");
+        let missing = owner.join("missing");
         assert!(!missing.exists());
         remove_all_empty_dir(&missing).expect("an already absent tree is an idempotent success");
     }

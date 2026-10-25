@@ -757,9 +757,11 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_writes_canonical_authority_form_only() {
+        let credential = uuid::Uuid::new_v4().to_string();
         let proxy = Proxy::new("http://127.0.0.1:8080", 1_000)
             .unwrap()
-            .basic_auth("proxy-user", "proxy-password");
+            .basic_auth("proxy-user", &credential);
+        let authorization = general_purpose::STANDARD.encode(format!("proxy-user:{credential}"));
         let cases = [
             (
                 TargetAddr::Domain(Cow::Borrowed("Example.COM"), 443),
@@ -788,7 +790,7 @@ mod tests {
             result.unwrap();
             let expected = format!(
                 "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\
-                 Proxy-Authorization: Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA==\r\n\r\n"
+                 Proxy-Authorization: Basic {authorization}\r\n\r\n"
             );
             assert_eq!(request, expected.as_bytes());
         }
