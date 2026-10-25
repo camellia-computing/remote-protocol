@@ -209,7 +209,6 @@ dependencies = [
  "confy",
  "crypto_box",
  "crypto_secretbox",
- "default_net",
  "directories-next",
  "dirs-next",
  "ed25519-dalek",
@@ -628,16 +627,6 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
-
-[[package]]
-name = "default_net"
-version = "0.1.0"
-source = "git+https://github.com/rustdesk-org/default_net?rev=78f8f70cd85151a3a2c4a3230d80d5272703c02e#78f8f70cd85151a3a2c4a3230d80d5272703c02e"
-dependencies = [
- "anyhow",
- "regex",
- "winapi",
-]
 
 [[package]]
 name = "defmt"

@@ -57,3 +57,23 @@ API. Remove it only when a supported implementation also preserves the fork's
 Linux process enumeration and file-descriptor behavior and passes Apple linking.
 
 See `SOURCE_PROVENANCE.json`, `NOTICE`, and `LICENSE` for origin and licensing information.
+
+The LEGAL-001 regression gate is shared with both native consumers:
+
+```bash
+python3 scripts/test_dependency_licenses.py
+python3 scripts/check_dependency_licenses.py --manifest Cargo.toml --lockfile Cargo.lock
+```
+
+It rejects the retired unlicensed Git packages and binds the existing
+`mac_address` replacement to its reviewed registry checksum and license-file
+digests in `dependency-license-decisions.json`. This is not a complete
+transitive or packaged-notice audit. Consumers must not retain the old Git
+packages in their own lockfiles after updating the Protocol source pin.
+
+Desktop fingerprint metadata now uses that provider's first non-loopback MAC,
+encoded as twelve uppercase hex digits plus four zeroes. No adapter or an OS
+lookup failure produces sixteen zeroes; failures emit only a bounded event,
+never a hardware address. Mobile retains its zero-valued field. This metadata
+is not an authentication identity, and adapter changes can change it; it is not
+a promise to preserve the removed provider's interface-selection behavior.

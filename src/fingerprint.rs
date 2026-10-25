@@ -194,6 +194,26 @@ static mut FINGERPRINTING_INFO: Option<FingerprintingInfo> = None;
 static INIT: Once = Once::new();
 static mut CACHED_FINGERPRINTS: Option<HashMap<String, Vec<u8>>> = None;
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn mac_fingerprint_address(
+    result: Result<Option<mac_address::MacAddress>, mac_address::MacAddressError>,
+) -> String {
+    let address = match result {
+        Ok(address) => address
+            .map(mac_address::MacAddress::bytes)
+            .unwrap_or([0; 6]),
+        Err(_) => {
+            // Hardware addresses and arbitrary OS errors are not log attributes.
+            log::warn!("event=fingerprint_mac_unavailable reason=provider_error");
+            [0; 6]
+        }
+    };
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}0000",
+        address[0], address[1], address[2], address[3], address[4], address[5]
+    )
+}
+
 impl FingerprintingInfo {
     fn new() -> Self {
         let mut sys = System::new();
@@ -226,18 +246,9 @@ impl FingerprintingInfo {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             addr: "0".repeat(16),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            addr: {
-                let mut addr = default_net::get_mac().map(|m| m.addr).unwrap_or_default();
-                if addr.is_empty() {
-                    addr = mac_address::get_mac_address()
-                        .ok()
-                        .and_then(|mac| mac)
-                        .map(|mac| mac.to_string())
-                        .unwrap_or_default();
-                }
-                addr = addr.replace(":", "");
-                format!("{:0<16}", addr)
-            },
+            // Reuse the reviewed cross-platform provider; never shell out or
+            // retain an unlicensed implementation as a fallback.
+            addr: mac_fingerprint_address(mac_address::get_mac_address()),
         }
     }
 }
@@ -378,4 +389,29 @@ fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
         .join("");
     hasher.update(fingerprint_string.as_bytes());
     hasher.finalize()
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod mac_fingerprint_tests {
+    use super::mac_fingerprint_address;
+    use mac_address::{MacAddress, MacAddressError};
+
+    #[test]
+    fn licensed_provider_address_has_one_fixed_uppercase_encoding() {
+        let address = MacAddress::new([0x00, 0x12, 0xab, 0xcd, 0xef, 0xff]);
+        assert_eq!(
+            mac_fingerprint_address(Ok(Some(address))),
+            "0012ABCDEFFF0000"
+        );
+        assert_eq!(mac_fingerprint_address(Ok(Some(address))).len(), 16);
+    }
+
+    #[test]
+    fn unavailable_hardware_has_a_deterministic_nonsecret_fallback() {
+        assert_eq!(mac_fingerprint_address(Ok(None)), "0000000000000000");
+        assert_eq!(
+            mac_fingerprint_address(Err(MacAddressError::InternalError)),
+            "0000000000000000"
+        );
+    }
 }

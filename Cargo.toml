@@ -70,7 +70,6 @@ libloading = "0.9"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 mac_address = "1.1"
-default_net = { git = "https://github.com/rustdesk-org/default_net", rev = "78f8f70cd85151a3a2c4a3230d80d5272703c02e" }
 machine-uid = "0.6.0"
 
 [build-dependencies]

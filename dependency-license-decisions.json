@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "scope": "LEGAL-001 targeted Git-source retirement; not a complete transitive license audit",
+  "blocked_packages": ["default_net", "impersonate_system"],
+  "blocked_git_repositories": [
+    "github.com/rustdesk-org/default_net",
+    "github.com/rustdesk-org/impersonate-system"
+  ],
+  "replacements": {
+    "mac_address": {
+      "version": "1.2.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "f3d0581a75c45969c63afd2bb87b1d8b25cfcc556c7a918cf9bb13b0fe8d2381",
+      "license": "MIT OR Apache-2.0",
+      "license_sha256": {
+        "LICENSE-MIT": "16c5a3cc951992b74de5f73206aa0005300fbe610708b76a25ca65006aab76d3",
+        "LICENSE-APACHE2.0": "c93a7014a32c88c71551bd6fb4cae8cc9445c237d7e4a0774d4fc5e06089dbd9"
+      }
+    }
+  }
+}
