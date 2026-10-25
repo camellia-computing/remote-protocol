@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -17,6 +17,7 @@ use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
+use sha2::{Digest, Sha256};
 
 mod permanent_password;
 
@@ -274,6 +275,149 @@ pub struct Socks5Server {
     pub password: String,
 }
 
+const MANAGED_POLICY_MAX_OPTIONS: usize = 512;
+const MANAGED_POLICY_MAX_ID_BYTES: usize = 128;
+const MANAGED_POLICY_MAX_UUID_BYTES: usize = 344;
+const MANAGED_POLICY_MAX_KEY_BYTES: usize = 512;
+const MANAGED_POLICY_MAX_VALUE_BYTES: usize = 16 * 1024;
+const MANAGED_POLICY_MAX_TOTAL_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ManagedPolicy {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    id: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    uuid: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    digest: String,
+    #[serde(default)]
+    options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedPolicyTransition {
+    Apply,
+    Unchanged,
+    RejectInvalid,
+    RejectRollback,
+    RejectConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedPolicyApplyResult {
+    Applied,
+    Unchanged,
+    RejectedInvalid,
+    RejectedRollback,
+    RejectedConflict,
+    StoreFailed,
+}
+
+impl ManagedPolicy {
+    pub fn from_wire(
+        id: String,
+        uuid: String,
+        generation: u64,
+        digest: String,
+        options: BTreeMap<String, String>,
+    ) -> Option<Self> {
+        let policy = Self {
+            id,
+            uuid,
+            generation,
+            digest,
+            options,
+        };
+        policy.is_valid().then_some(policy)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn uuid(&self) -> &str {
+        &self.uuid
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn options(&self) -> &BTreeMap<String, String> {
+        &self.options
+    }
+
+    pub fn canonical_digest(options: &BTreeMap<String, String>) -> Option<String> {
+        let encoded = serde_json::to_vec(options).ok()?;
+        if encoded.len() > MANAGED_POLICY_MAX_TOTAL_BYTES {
+            return None;
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = Sha256::digest(encoded);
+        Some(
+            digest
+                .iter()
+                .flat_map(|byte| {
+                    [
+                        HEX[usize::from(*byte >> 4)] as char,
+                        HEX[usize::from(*byte & 0x0f)] as char,
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= MANAGED_POLICY_MAX_ID_BYTES
+            && !self.id.chars().any(|character| character < ' ')
+            && !self.uuid.is_empty()
+            && self.uuid.len() <= MANAGED_POLICY_MAX_UUID_BYTES
+            && !self.uuid.chars().any(|character| character < ' ')
+            && self.options.len() <= MANAGED_POLICY_MAX_OPTIONS
+            && self.options.iter().all(|(key, value)| {
+                !key.is_empty()
+                    && key.chars().count() <= 128
+                    && key.len() <= MANAGED_POLICY_MAX_KEY_BYTES
+                    && value.chars().count() <= 4096
+                    && value.len() <= MANAGED_POLICY_MAX_VALUE_BYTES
+                    && !key.chars().any(|character| character < ' ')
+            })
+            && self.digest.len() == 64
+            && self
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && Self::canonical_digest(&self.options).as_deref() == Some(self.digest.as_str())
+    }
+
+    pub fn transition_from(&self, current: &Self) -> ManagedPolicyTransition {
+        if !self.is_valid() {
+            return ManagedPolicyTransition::RejectInvalid;
+        }
+        if current.id.is_empty() || current.id != self.id || current.uuid != self.uuid {
+            return ManagedPolicyTransition::Apply;
+        }
+        if self.generation < current.generation {
+            return ManagedPolicyTransition::RejectRollback;
+        }
+        if self.generation == current.generation {
+            return if self.digest == current.digest && self.options == current.options {
+                ManagedPolicyTransition::Unchanged
+            } else {
+                ManagedPolicyTransition::RejectConflict
+            };
+        }
+        ManagedPolicyTransition::Apply
+    }
+}
+
 // more variable configs
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config2 {
@@ -294,6 +438,11 @@ pub struct Config2 {
     // the other scalar value must before this
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     pub options: HashMap<String, String>,
+
+    // Management-owned values are separate from user options so a tombstone
+    // can reveal the previous user/default value without destructive merging.
+    #[serde(default)]
+    managed_policy: ManagedPolicy,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
@@ -548,6 +697,11 @@ impl Config2 {
                 store = true;
             }
         }
+        if config.managed_policy != ManagedPolicy::default() && !config.managed_policy.is_valid() {
+            log::error!("Clearing invalid persisted managed policy state");
+            config.managed_policy = ManagedPolicy::default();
+            store = true;
+        }
         if store {
             config.store();
         }
@@ -558,7 +712,7 @@ impl Config2 {
         Config::file_("2")
     }
 
-    fn store(&self) {
+    fn try_store(&self) -> Result<()> {
         let mut config = self.clone();
         let stored = Config::load_::<Config2>("2");
         if let Some(mut socks) = config.socks {
@@ -567,33 +721,35 @@ impl Config2 {
                 .as_ref()
                 .map(|socks| socks.password.as_str())
                 .unwrap_or_default();
-            let Ok(password) =
+            let password =
                 encrypted_storage_for_plaintext(&socks.password, stored_password, ENCRYPT_MAX_LEN)
-            else {
-                log::error!("Refusing to store Config2 because the SOCKS password is invalid");
-                return;
-            };
+                    .map_err(|err| anyhow!("Invalid SOCKS password storage: {err}"))?;
             socks.password = password;
             config.socks = Some(socks);
         }
-        let Ok(unlock_pin) = encrypted_storage_for_plaintext(
+        let unlock_pin = encrypted_storage_for_plaintext(
             &config.unlock_pin,
             &stored.unlock_pin,
             ENCRYPT_MAX_LEN,
-        ) else {
-            log::error!("Refusing to store Config2 because the unlock PIN is invalid");
-            return;
-        };
+        )
+        .map_err(|err| anyhow!("Invalid unlock PIN storage: {err}"))?;
         config.unlock_pin = unlock_pin;
-        Config::store_(&config, "2");
+        Config::try_store_(&config, "2")
+    }
+
+    fn store(&self) {
+        if let Err(err) = self.try_store() {
+            log::error!("Refusing to store Config2: {err}");
+        }
     }
 
     pub fn get() -> Config2 {
         return CONFIG2.read().unwrap().clone();
     }
 
-    pub fn set(cfg: Config2) -> bool {
+    pub fn set(mut cfg: Config2) -> bool {
         let mut lock = CONFIG2.write().unwrap();
+        cfg.managed_policy = lock.managed_policy.clone();
         if *lock == cfg {
             return false;
         }
@@ -662,10 +818,14 @@ impl Config {
     }
 
     fn store_<T: serde::Serialize>(config: &T, suffix: &str) {
-        let file = Self::file_(suffix);
-        if let Err(err) = store_path(file, config) {
+        if let Err(err) = Self::try_store_(config, suffix) {
             log::error!("Failed to store {suffix} config: {err}");
         }
+    }
+
+    fn try_store_<T: serde::Serialize>(config: &T, suffix: &str) -> Result<()> {
+        let file = Self::file_(suffix);
+        store_path(file, config)
     }
 
     fn load() -> Config {
@@ -1227,7 +1387,19 @@ impl Config {
 
     pub fn get_options() -> HashMap<String, String> {
         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
-        res.extend(CONFIG2.read().unwrap().options.clone());
+        {
+            let config = CONFIG2
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            res.extend(config.options.clone());
+            res.extend(
+                config
+                    .managed_policy
+                    .options
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
         res
     }
@@ -1240,6 +1412,16 @@ impl Config {
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
         let mut config = CONFIG2.write().unwrap();
+        // UI callers submit the effective map. Do not copy Management-owned
+        // values into the user layer, and retain any user values hidden below
+        // the managed layer so a future tombstone can reveal them.
+        for key in config.managed_policy.options.keys() {
+            if let Some(user_value) = config.options.get(key) {
+                v.insert(key.clone(), user_value.clone());
+            } else {
+                v.remove(key);
+            }
+        }
         if config.options == v {
             return;
         }
@@ -1248,13 +1430,63 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
-        get_or(
-            &OVERWRITE_SETTINGS,
-            &CONFIG2.read().unwrap().options,
-            &DEFAULT_SETTINGS,
-            k,
-        )
-        .unwrap_or_default()
+        if let Some(value) = OVERWRITE_SETTINGS
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(k)
+        {
+            return value.clone();
+        }
+        let configured = {
+            let config = CONFIG2
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            config
+                .managed_policy
+                .options
+                .get(k)
+                .or_else(|| config.options.get(k))
+                .cloned()
+        };
+        configured
+            .or_else(|| {
+                DEFAULT_SETTINGS
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(k)
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_managed_policy() -> ManagedPolicy {
+        CONFIG2
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .managed_policy
+            .clone()
+    }
+
+    pub fn apply_managed_policy(policy: ManagedPolicy) -> ManagedPolicyApplyResult {
+        let mut config = CONFIG2
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match policy.transition_from(&config.managed_policy) {
+            ManagedPolicyTransition::Unchanged => ManagedPolicyApplyResult::Unchanged,
+            ManagedPolicyTransition::RejectInvalid => ManagedPolicyApplyResult::RejectedInvalid,
+            ManagedPolicyTransition::RejectRollback => ManagedPolicyApplyResult::RejectedRollback,
+            ManagedPolicyTransition::RejectConflict => ManagedPolicyApplyResult::RejectedConflict,
+            ManagedPolicyTransition::Apply => {
+                let mut next = config.clone();
+                next.managed_policy = policy;
+                if let Err(err) = next.try_store() {
+                    log::error!("Failed to persist managed policy: {err}");
+                    return ManagedPolicyApplyResult::StoreFailed;
+                }
+                *config = next;
+                ManagedPolicyApplyResult::Applied
+            }
+        }
     }
 
     pub fn get_bool_option(k: &str) -> bool {
@@ -1262,6 +1494,15 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        if CONFIG2
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .managed_policy
+            .options
+            .contains_key(&k)
+        {
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -2567,18 +2808,24 @@ impl Ab {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                log::error!("ab data too large, {} > {}", data.len(), max_len);
+        let data = match compress(json.as_bytes()) {
+            Ok(data) => data,
+            Err(err) => {
+                log::error!("failed to compress address book data: {err}");
                 return;
             }
-            if let Ok(data) = encrypt_local(&data) {
+        };
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            log::error!("ab data too large, {} > {}", data.len(), max_len);
+            return;
+        }
+        if let Ok(data) = encrypt_local(&data) {
+            if let Ok(mut file) = std::fs::File::create(Self::path()) {
                 file.write_all(&data).ok();
             }
-        };
+        }
     }
 
     pub fn load() -> Ab {
@@ -2586,9 +2833,11 @@ impl Ab {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
                 if let Ok(data) = decrypt_local(&data) {
-                    let data = decompress(&data);
-                    if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
-                        return ab;
+                    if let Ok(data) = decompress(&data) {
+                        if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data))
+                        {
+                            return ab;
+                        }
                     }
                 }
             }
@@ -2697,17 +2946,23 @@ impl Group {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
+        let data = match compress(json.as_bytes()) {
+            Ok(data) => data,
+            Err(err) => {
+                log::error!("failed to compress group data: {err}");
                 return;
             }
-            if let Ok(data) = encrypt_local(&data) {
+        };
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            return;
+        }
+        if let Ok(data) = encrypt_local(&data) {
+            if let Ok(mut file) = std::fs::File::create(Self::path()) {
                 file.write_all(&data).ok();
             }
-        };
+        }
     }
 
     pub fn load() -> Self {
@@ -2715,10 +2970,12 @@ impl Group {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
                 if let Ok(data) = decrypt_local(&data) {
-                    let data = decompress(&data);
-                    if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
-                    {
-                        return group;
+                    if let Ok(data) = decompress(&data) {
+                        if let Ok(group) =
+                            serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
+                        {
+                            return group;
+                        }
                     }
                 }
             }
@@ -3318,6 +3575,8 @@ mod tests {
         original_config: Config,
         original_config2: Config2,
         original_hard_settings: HashMap<String, String>,
+        original_default_settings: HashMap<String, String>,
+        original_overwrite_settings: HashMap<String, String>,
         original_trusted_devices: (Vec<TrustedDevice>, bool),
     }
 
@@ -3333,6 +3592,8 @@ mod tests {
             let original_config = Config::get();
             let original_config2 = CONFIG2.read().unwrap().clone();
             let original_hard_settings = HARD_SETTINGS.read().unwrap().clone();
+            let original_default_settings = DEFAULT_SETTINGS.read().unwrap().clone();
+            let original_overwrite_settings = OVERWRITE_SETTINGS.read().unwrap().clone();
             let original_trusted_devices = TRUSTED_DEVICES.read().unwrap().clone();
             *CONFIG.write().unwrap() = config;
             *CONFIG2.write().unwrap() = Config2::default();
@@ -3342,6 +3603,8 @@ mod tests {
                 original_config,
                 original_config2,
                 original_hard_settings,
+                original_default_settings,
+                original_overwrite_settings,
                 original_trusted_devices,
             }
         }
@@ -3352,6 +3615,8 @@ mod tests {
             *CONFIG.write().unwrap() = self.original_config.clone();
             *CONFIG2.write().unwrap() = self.original_config2.clone();
             *HARD_SETTINGS.write().unwrap() = self.original_hard_settings.clone();
+            *DEFAULT_SETTINGS.write().unwrap() = self.original_default_settings.clone();
+            *OVERWRITE_SETTINGS.write().unwrap() = self.original_overwrite_settings.clone();
             *TRUSTED_DEVICES.write().unwrap() = self.original_trusted_devices.clone();
         }
     }
@@ -3412,6 +3677,217 @@ mod tests {
         let _path_guard = ConfigPathTestGuard::new();
         let _state_guard = ConfigStateTestGuard::new(config, hard_settings);
         test()
+    }
+
+    fn managed_policy(
+        id: &str,
+        uuid: &str,
+        generation: u64,
+        options: BTreeMap<String, String>,
+    ) -> ManagedPolicy {
+        let digest = ManagedPolicy::canonical_digest(&options).unwrap();
+        ManagedPolicy::from_wire(id.to_owned(), uuid.to_owned(), generation, digest, options)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_managed_policy_digest_matches_management_canonical_json() {
+        let options = BTreeMap::from([
+            ("unicode".to_owned(), "雪/é".to_owned()),
+            ("quote".to_owned(), "a\"b\n".to_owned()),
+            ("approve-mode".to_owned(), "password".to_owned()),
+        ]);
+
+        assert_eq!(
+            ManagedPolicy::canonical_digest(&options).as_deref(),
+            Some("b9d80ff3556f4b8cdc0ced84602f15c4bc6ed89b6d003bb58a99f7936e051c24")
+        );
+        assert!(ManagedPolicy::from_wire(
+            "123456789".to_owned(),
+            "deployment-uuid".to_owned(),
+            1,
+            "0".repeat(64),
+            options.clone(),
+        )
+        .is_none());
+        assert!(ManagedPolicy::from_wire(
+            "x".repeat(MANAGED_POLICY_MAX_ID_BYTES + 1),
+            "deployment-uuid".to_owned(),
+            1,
+            ManagedPolicy::canonical_digest(&options).unwrap(),
+            options.clone(),
+        )
+        .is_none());
+        assert!(ManagedPolicy::from_wire(
+            "123456789".to_owned(),
+            "x".repeat(MANAGED_POLICY_MAX_UUID_BYTES + 1),
+            1,
+            ManagedPolicy::canonical_digest(&options).unwrap(),
+            options.clone(),
+        )
+        .is_none());
+
+        let oversized = BTreeMap::from([(
+            "key".to_owned(),
+            "v".repeat(MANAGED_POLICY_MAX_VALUE_BYTES + 1),
+        )]);
+        assert!(ManagedPolicy::canonical_digest(&oversized).is_some());
+        assert!(ManagedPolicy::from_wire(
+            "123456789".to_owned(),
+            "deployment-uuid".to_owned(),
+            1,
+            ManagedPolicy::canonical_digest(&oversized).unwrap(),
+            oversized,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_managed_policy_transition_rejects_rollback_and_conflict() {
+        let current = managed_policy(
+            "123456789",
+            "deployment-uuid",
+            8,
+            BTreeMap::from([("approve-mode".to_owned(), "password".to_owned())]),
+        );
+
+        assert_eq!(
+            current.transition_from(&ManagedPolicy::default()),
+            ManagedPolicyTransition::Apply
+        );
+        assert_eq!(
+            current.transition_from(&current),
+            ManagedPolicyTransition::Unchanged
+        );
+        assert_eq!(
+            managed_policy("123456789", "deployment-uuid", 7, BTreeMap::new())
+                .transition_from(&current),
+            ManagedPolicyTransition::RejectRollback
+        );
+        assert_eq!(
+            managed_policy("123456789", "deployment-uuid", 8, BTreeMap::new())
+                .transition_from(&current),
+            ManagedPolicyTransition::RejectConflict
+        );
+        assert_eq!(
+            managed_policy("123456789", "deployment-uuid", 9, BTreeMap::new())
+                .transition_from(&current),
+            ManagedPolicyTransition::Apply
+        );
+        assert_eq!(
+            managed_policy("new-id", "deployment-uuid", 0, BTreeMap::new())
+                .transition_from(&current),
+            ManagedPolicyTransition::Apply
+        );
+        assert_eq!(
+            managed_policy("123456789", "new-uuid", 0, BTreeMap::new()).transition_from(&current),
+            ManagedPolicyTransition::Apply
+        );
+
+        let mut invalid = current;
+        invalid.digest = "f".repeat(64);
+        assert_eq!(
+            invalid.transition_from(&ManagedPolicy::default()),
+            ManagedPolicyTransition::RejectInvalid
+        );
+    }
+
+    #[test]
+    fn test_managed_policy_layer_precedence_persistence_and_tombstone() {
+        let _guard = lock_config_state_for_test();
+        let _path_guard = ConfigPathTestGuard::new();
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        *DEFAULT_SETTINGS.write().unwrap() = HashMap::from([
+            ("managed-default".to_owned(), "default".to_owned()),
+            ("overwrite".to_owned(), "default".to_owned()),
+        ]);
+        *OVERWRITE_SETTINGS.write().unwrap() =
+            HashMap::from([("overwrite".to_owned(), "built-in".to_owned())]);
+        CONFIG2.write().unwrap().options = HashMap::from([
+            ("managed-default".to_owned(), "user".to_owned()),
+            ("user-only".to_owned(), "user-only-value".to_owned()),
+        ]);
+
+        let applied = managed_policy(
+            "123456789",
+            "deployment-uuid",
+            1,
+            BTreeMap::from([
+                ("managed-default".to_owned(), "managed".to_owned()),
+                ("managed-only".to_owned(), "managed-only-value".to_owned()),
+                ("overwrite".to_owned(), "managed".to_owned()),
+            ]),
+        );
+        assert_eq!(
+            Config::apply_managed_policy(applied.clone()),
+            ManagedPolicyApplyResult::Applied
+        );
+        assert_eq!(Config::get_option("managed-default"), "managed");
+        assert_eq!(Config::get_option("managed-only"), "managed-only-value");
+        assert_eq!(Config::get_option("user-only"), "user-only-value");
+        assert_eq!(Config::get_option("overwrite"), "built-in");
+        assert_eq!(
+            Config::load_::<Config2>("2").managed_policy,
+            applied,
+            "managed policy must be durable before apply returns"
+        );
+
+        Config::set_option("managed-default".to_owned(), "attempted-change".to_owned());
+        let mut submitted_effective = Config::get_options();
+        submitted_effective.insert("managed-default".to_owned(), "second-attempt".to_owned());
+        Config::set_options(submitted_effective);
+        assert_eq!(
+            CONFIG2
+                .read()
+                .unwrap()
+                .options
+                .get("managed-default")
+                .map(String::as_str),
+            Some("user")
+        );
+
+        let tombstone = managed_policy("123456789", "deployment-uuid", 2, BTreeMap::new());
+        assert_eq!(
+            Config::apply_managed_policy(tombstone.clone()),
+            ManagedPolicyApplyResult::Applied
+        );
+        assert_eq!(Config::get_option("managed-default"), "user");
+        assert_eq!(Config::get_option("managed-only"), "");
+        assert_eq!(Config::get_option("overwrite"), "built-in");
+        assert_eq!(
+            Config::apply_managed_policy(applied),
+            ManagedPolicyApplyResult::RejectedRollback
+        );
+
+        *CONFIG2.write().unwrap() = Config2::load();
+        assert_eq!(Config::get_managed_policy(), tombstone);
+        assert_eq!(Config::get_option("managed-default"), "user");
+    }
+
+    #[test]
+    fn test_managed_policy_store_failure_does_not_publish_memory_state() {
+        let _guard = lock_config_state_for_test();
+        let path_guard = ConfigPathTestGuard::new();
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        let config_file = Config2::file();
+        let config_parent = config_file.parent().unwrap();
+        fs::create_dir_all(config_parent.parent().unwrap()).unwrap();
+        fs::write(config_parent, b"not-a-directory").unwrap();
+
+        let policy = managed_policy(
+            "123456789",
+            "deployment-uuid",
+            1,
+            BTreeMap::from([("approve-mode".to_owned(), "password".to_owned())]),
+        );
+        assert_eq!(
+            Config::apply_managed_policy(policy),
+            ManagedPolicyApplyResult::StoreFailed
+        );
+        assert_eq!(Config::get_managed_policy(), ManagedPolicy::default());
+        assert_eq!(Config::get_option("approve-mode"), "");
+
+        drop(path_guard);
     }
 
     #[test]

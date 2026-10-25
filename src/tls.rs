@@ -1,67 +1,26 @@
-use std::{collections::HashMap, sync::RwLock};
-
-#[derive(Debug, Clone, Copy)]
+/// TLS mode is a property of the URL scheme, not a discovered capability.
+/// Rustls is the only encrypted backend; successful domains need no cache.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TlsType {
     Plain,
     Rustls,
 }
 
-lazy_static::lazy_static! {
-    static ref URL_TLS_TYPE: RwLock<HashMap<String, TlsType>> = RwLock::new(HashMap::new());
-}
-
-#[inline]
-pub fn is_plain(url: &str) -> bool {
-    url.starts_with("ws://") || url.starts_with("http://")
-}
-
-// Extract domain from URL.
-// e.g., "https://example.com/path" -> "example.com"
-//       "https://example.com:8080/path" -> "example.com:8080"
-// See the tests for more examples.
-#[inline]
-fn get_domain_and_port_from_url(url: &str) -> &str {
-    // Remove scheme (e.g., http://, https://, ws://, wss://)
-    let scheme_end = url.find("://").map(|pos| pos + 3).unwrap_or(0);
-    let url2 = &url[scheme_end..];
-    // If userinfo is present, domain is after last '@'
-    let after_at = match url2.rfind('@') {
-        Some(pos) => &url2[pos + 1..],
-        None => url2,
-    };
-    // Find the end of domain (before '/' or '?')
-    let domain_end = after_at.find(&['/', '?'][..]).unwrap_or(after_at.len());
-    &after_at[..domain_end]
-}
-
-#[inline]
-pub fn upsert_tls_cache(url: &str, tls_type: TlsType) {
-    if is_plain(url) {
-        return;
+impl TlsType {
+    pub fn for_url(value: &str) -> crate::ResultType<Self> {
+        if value.len() > 4096 {
+            return Err(anyhow::anyhow!("Invalid TLS URL"));
+        }
+        let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("Invalid TLS URL"))?;
+        if url.host_str().is_none() {
+            return Err(anyhow::anyhow!("Invalid TLS URL"));
+        }
+        match url.scheme() {
+            "http" | "ws" => Ok(Self::Plain),
+            "https" | "wss" => Ok(Self::Rustls),
+            _ => Err(anyhow::anyhow!("Unsupported TLS URL scheme")),
+        }
     }
-
-    let domain_port = get_domain_and_port_from_url(url);
-    // Use curly braces to ensure the lock is released immediately.
-    {
-        URL_TLS_TYPE
-            .write()
-            .unwrap()
-            .insert(domain_port.to_string(), tls_type);
-    }
-}
-
-#[inline]
-pub fn reset_tls_cache() {
-    URL_TLS_TYPE.write().unwrap().clear();
-}
-
-#[inline]
-pub fn get_cached_tls_type(url: &str) -> Option<TlsType> {
-    if is_plain(url) {
-        return Some(TlsType::Plain);
-    }
-    let domain_port = get_domain_and_port_from_url(url);
-    URL_TLS_TYPE.read().unwrap().get(domain_port).cloned()
 }
 
 #[cfg(test)]
@@ -69,21 +28,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_domain_and_port_from_url() {
-        for (url, expected_domain_port) in vec![
-            ("http://example.com", "example.com"),
-            ("https://example.com", "example.com"),
-            ("ws://example.com/path", "example.com"),
-            ("wss://example.com:8080/path", "example.com:8080"),
-            ("https://user:pass@example.com", "example.com"),
-            ("https://example.com?query=param", "example.com"),
-            ("https://example.com:8443?query=param", "example.com:8443"),
-            ("ftp://example.com/resource", "example.com"), // ftp scheme
-            ("example.com/path", "example.com"),           // no scheme
-            ("example.com:8080/path", "example.com:8080"),
+    fn tls_mode_is_deterministic_for_scheme_not_a_previous_domain_result() {
+        for value in [
+            "http://example.test",
+            "ws://example.test/path",
+            "HTTP://EXAMPLE.TEST:8080",
         ] {
-            let domain_port = get_domain_and_port_from_url(url);
-            assert_eq!(domain_port, expected_domain_port);
+            assert_eq!(TlsType::for_url(value).unwrap(), TlsType::Plain);
         }
+        for value in [
+            "https://example.test",
+            "wss://[::1]:8443/path",
+            "HTTPS://EXAMPLE.TEST",
+        ] {
+            assert_eq!(TlsType::for_url(value).unwrap(), TlsType::Rustls);
+        }
+        for index in 0..1000 {
+            assert_eq!(
+                TlsType::for_url(&format!("https://host-{index}.invalid/path")).unwrap(),
+                TlsType::Rustls
+            );
+        }
+        // There is intentionally no global state, admission lock or domain
+        // allocation retained by a successful connection.
+    }
+
+    #[test]
+    fn invalid_urls_fail_with_static_diagnostics() {
+        for value in [
+            "",
+            "file:///private",
+            "ftp://user:SECRET@host.test",
+            "https://",
+            "invalid",
+        ] {
+            let error = TlsType::for_url(value).unwrap_err().to_string();
+            assert!(!error.contains("SECRET"));
+            assert!(!error.contains("private"));
+        }
+        assert!(TlsType::for_url(&"x".repeat(4097)).is_err());
     }
 }

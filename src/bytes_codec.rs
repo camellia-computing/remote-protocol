@@ -5,6 +5,17 @@ use tokio_util::codec::{Decoder, Encoder};
 // Bound speculative allocation from untrusted frame headers.
 const MAX_PREALLOCATED_PAYLOAD_LEN: usize = 256 * 1024;
 
+/// Safe fallback for callers that do not select a narrower application budget.
+pub const DEFAULT_MAX_PACKET_LENGTH: usize = 8 * 1024 * 1024;
+/// Remote-session frames can contain compressed 4K video keyframes and clipboard payloads.
+pub const SESSION_MAX_PACKET_LENGTH: usize = 64 * 1024 * 1024;
+/// Local IPC carries bounded file chunks, configuration snapshots, and printer payloads.
+pub const IPC_MAX_PACKET_LENGTH: usize = 64 * 1024 * 1024;
+/// Rendezvous control includes the explicitly bounded HTTP proxy response body.
+pub const RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH: usize = 17 * 1024 * 1024;
+/// Relay TCP framing is used only for the initial pairing control message.
+pub const RELAY_CONTROL_MAX_PACKET_LENGTH: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BytesCodec {
     state: DecodeState,
@@ -26,19 +37,27 @@ impl Default for BytesCodec {
 
 impl BytesCodec {
     pub fn new() -> Self {
+        Self::with_max_packet_length(DEFAULT_MAX_PACKET_LENGTH)
+    }
+
+    pub fn for_session() -> Self {
+        Self::with_max_packet_length(SESSION_MAX_PACKET_LENGTH)
+    }
+
+    pub fn for_ipc() -> Self {
+        Self::with_max_packet_length(IPC_MAX_PACKET_LENGTH)
+    }
+
+    pub fn with_max_packet_length(max_packet_length: usize) -> Self {
         Self {
             state: DecodeState::Head,
             raw: false,
-            max_packet_length: usize::MAX,
+            max_packet_length,
         }
     }
 
     pub fn set_raw(&mut self) {
         self.raw = true;
-    }
-
-    pub fn set_max_packet_length(&mut self, n: usize) {
-        self.max_packet_length = n;
     }
 
     fn decode_head(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
@@ -123,6 +142,12 @@ impl Encoder<Bytes> for BytesCodec {
             buf.reserve(data.len());
             buf.put(data);
             return Ok(());
+        }
+        if data.len() > self.max_packet_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Too big packet",
+            ));
         }
         if data.len() <= 0x3F {
             buf.put_u8((data.len() << 2) as u8);
@@ -288,7 +313,7 @@ mod tests {
 
     #[test]
     fn decode_large_frame_header_caps_preallocation() {
-        let mut codec = BytesCodec::new();
+        let mut codec = BytesCodec::with_max_packet_length(0x3FFFFFFF);
         let mut buf = BytesMut::new();
         let n = 0x3FFFFFFFusize;
         const MAX_REASONABLE_CAPACITY: usize = MAX_PREALLOCATED_PAYLOAD_LEN * 4;
@@ -297,5 +322,46 @@ mod tests {
 
         assert!(matches!(codec.decode(&mut buf), Ok(None)));
         assert!(buf.capacity() <= MAX_REASONABLE_CAPACITY);
+    }
+
+    #[test]
+    fn configured_budget_is_enforced_for_encode_and_decode_boundaries() {
+        let mut codec = BytesCodec::with_max_packet_length(8);
+        let mut encoded = BytesMut::new();
+
+        codec
+            .encode(Bytes::from_static(b"12345678"), &mut encoded)
+            .unwrap();
+        assert_eq!(
+            codec.decode(&mut encoded).unwrap().unwrap(),
+            b"12345678"[..]
+        );
+
+        let err = codec
+            .encode(Bytes::from_static(b"123456789"), &mut encoded)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut oversized_header = BytesMut::new();
+        oversized_header.put_u8(9 << 2);
+        let err = codec.decode(&mut oversized_header).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(oversized_header.len(), 1);
+    }
+
+    #[test]
+    fn default_frame_budget_rejects_the_wire_max_before_payload() {
+        let mut codec = BytesCodec::new();
+        let mut buf = BytesMut::new();
+        let n = 0x3FFFFFFFusize;
+        buf.put_u32_le((n << 2) as u32 | 0x3);
+
+        let err = codec
+            .decode(&mut buf)
+            .expect_err("the default codec must reject the maximum declared frame");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(buf.len(), std::mem::size_of::<u32>());
+        assert!(buf.capacity() < MAX_PREALLOCATED_PAYLOAD_LEN);
     }
 }

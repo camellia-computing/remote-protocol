@@ -188,11 +188,164 @@ pub fn get_display_server_of_session(session: &str) -> String {
 }
 
 #[inline]
-fn line_values(indices: &[usize], line: &str) -> Vec<String> {
+fn session_values(indices: &[usize], fields: &[String]) -> Vec<String> {
     indices
         .iter()
-        .map(|idx| line.split_whitespace().nth(*idx).unwrap_or("").to_owned())
+        .map(|idx| fields.get(*idx).cloned().unwrap_or_default())
         .collect::<Vec<String>>()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ListedSession {
+    fields: Vec<String>,
+}
+
+impl ListedSession {
+    fn id(&self) -> &str {
+        self.fields.first().map(String::as_str).unwrap_or("")
+    }
+
+    fn username(&self) -> &str {
+        self.fields.get(2).map(String::as_str).unwrap_or("")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionProperties {
+    state: String,
+    active: String,
+    seat: String,
+    remote: String,
+    class: String,
+    session_type: String,
+}
+
+impl SessionProperties {
+    fn is_active(&self) -> bool {
+        self.state == "active" && self.active == "yes"
+    }
+
+    fn is_local_graphical(&self) -> bool {
+        self.remote == "no"
+            && matches!(
+                self.session_type.as_str(),
+                DISPLAY_SERVER_X11 | DISPLAY_SERVER_WAYLAND
+            )
+            && !matches!(
+                self.class.as_str(),
+                "manager" | "manager-early" | "background"
+            )
+    }
+}
+
+fn parse_listed_sessions(output: &[u8]) -> Option<Vec<ListedSession>> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut sessions = Vec::<ListedSession>::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if fields.len() < 4
+            || fields[0].is_empty()
+            || fields[1].parse::<u32>().is_err()
+            || fields[2].is_empty()
+            || sessions.iter().any(|session| session.id() == fields[0])
+        {
+            return None;
+        }
+        sessions.push(ListedSession { fields });
+    }
+    Some(sessions)
+}
+
+fn parse_session_properties(output: &[u8]) -> Option<SessionProperties> {
+    const EXPECTED_PROPERTIES: [&str; 6] = ["State", "Active", "Seat", "Remote", "Class", "Type"];
+    let text = std::str::from_utf8(output).ok()?;
+    let mut values = HashMap::with_capacity(EXPECTED_PROPERTIES.len());
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let (name, value) = line.split_once('=')?;
+        if !EXPECTED_PROPERTIES.contains(&name) || values.insert(name, value).is_some() {
+            return None;
+        }
+    }
+    if values.len() != EXPECTED_PROPERTIES.len()
+        || !matches!(values.get("Active"), Some(&"yes" | &"no"))
+        || !matches!(values.get("Remote"), Some(&"yes" | &"no"))
+    {
+        return None;
+    }
+    Some(SessionProperties {
+        state: values.remove("State")?.to_owned(),
+        active: values.remove("Active")?.to_owned(),
+        seat: values.remove("Seat")?.to_owned(),
+        remote: values.remove("Remote")?.to_owned(),
+        class: values.remove("Class")?.to_owned(),
+        session_type: values.remove("Type")?.to_owned(),
+    })
+}
+
+fn get_session_properties(sid: &str) -> Option<SessionProperties> {
+    if sid.is_empty() {
+        return None;
+    }
+    let output = run_loginctl(Some(vec![
+        "show-session",
+        "--no-pager",
+        "-p",
+        "State",
+        "-p",
+        "Active",
+        "-p",
+        "Seat",
+        "-p",
+        "Remote",
+        "-p",
+        "Class",
+        "-p",
+        "Type",
+        "--",
+        sid,
+    ]))
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_session_properties(&output.stdout)
+}
+
+fn select_active_session(
+    sessions: &[ListedSession],
+    ignore_gdm_wayland: bool,
+    mut properties_for: impl FnMut(&str) -> Option<SessionProperties>,
+) -> Option<&ListedSession> {
+    let mut seat0 = Vec::new();
+    let mut without_seat = Vec::new();
+    for session in sessions {
+        let properties = properties_for(session.id())?;
+        if !properties.is_active() || !properties.is_local_graphical() {
+            continue;
+        }
+        if ignore_gdm_wayland
+            && is_gdm_user(session.username())
+            && properties.session_type == DISPLAY_SERVER_WAYLAND
+        {
+            continue;
+        }
+        if properties.seat == "seat0" {
+            seat0.push(session);
+        } else if properties.seat.is_empty() {
+            without_seat.push(session);
+        }
+    }
+    match seat0.as_slice() {
+        [session] => Some(*session),
+        [] => match without_seat.as_slice() {
+            [session] => Some(*session),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[inline]
@@ -205,73 +358,26 @@ pub fn get_values_of_seat0_with_gdm_wayland(indices: &[usize]) -> Vec<String> {
     _get_values_of_seat0(indices, false)
 }
 
-// Ignore "3 sessions listed."
-fn ignore_loginctl_line(line: &str) -> bool {
-    line.contains("sessions") || line.split(" ").count() < 4
-}
-
 fn _get_values_of_seat0(indices: &[usize], ignore_gdm_wayland: bool) -> Vec<String> {
-    if let Ok(output) = run_loginctl(None) {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if ignore_loginctl_line(line) {
-                continue;
-            }
-            if line.contains("seat0") {
-                if let Some(sid) = line.split_whitespace().next() {
-                    if is_active(sid) {
-                        if ignore_gdm_wayland
-                            && is_gdm_user(line.split_whitespace().nth(2).unwrap_or(""))
-                            && get_display_server_of_session(sid) == DISPLAY_SERVER_WAYLAND
-                        {
-                            continue;
-                        }
-                        return line_values(indices, line);
-                    }
-                }
-            }
-        }
-
-        // some case, there is no seat0 https://github.com/rustdesk/rustdesk/issues/73
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if ignore_loginctl_line(line) {
-                continue;
-            }
-            if let Some(sid) = line.split_whitespace().next() {
-                if is_active(sid) {
-                    let d = get_display_server_of_session(sid);
-                    if ignore_gdm_wayland
-                        && is_gdm_user(line.split_whitespace().nth(2).unwrap_or(""))
-                        && d == DISPLAY_SERVER_WAYLAND
-                    {
-                        continue;
-                    }
-                    if d == "tty" || d == "unspecified" {
-                        continue;
-                    }
-                    return line_values(indices, line);
-                }
-            }
-        }
-    }
-
-    line_values(indices, "")
+    let selected = run_loginctl(Some(vec!["list-sessions", "--no-legend", "--no-pager"]))
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_listed_sessions(&output.stdout))
+        .and_then(|sessions| {
+            select_active_session(&sessions, ignore_gdm_wayland, get_session_properties)
+                .map(|session| session_values(indices, &session.fields))
+        });
+    selected.unwrap_or_else(|| vec![String::new(); indices.len()])
 }
 
 pub fn is_active(sid: &str) -> bool {
-    if let Ok(output) = run_loginctl(Some(vec!["show-session", "-p", "State", sid])) {
-        String::from_utf8_lossy(&output.stdout).contains("active")
-    } else {
-        false
-    }
+    get_session_properties(sid).is_some_and(|properties| properties.is_active())
 }
 
 pub fn is_active_and_seat0(sid: &str) -> bool {
-    if let Ok(output) = run_loginctl(Some(vec!["show-session", sid])) {
-        String::from_utf8_lossy(&output.stdout).contains("State=active")
-            && String::from_utf8_lossy(&output.stdout).contains("Seat=seat0")
-    } else {
-        false
-    }
+    get_session_properties(sid).is_some_and(|properties| {
+        properties.is_active() && properties.seat == "seat0" && properties.is_local_graphical()
+    })
 }
 
 // Check both "Lock" and "Switch user"
@@ -499,6 +605,119 @@ mod tests {
             run_cmds_trim_newline("whoami").unwrap() + "\n",
             run_cmds("whoami").unwrap()
         );
+    }
+
+    #[test]
+    fn inactive_session_state_is_not_active() {
+        assert!(!session_properties("inactive", "no", "seat0", "no", "user", "x11").is_active());
+    }
+
+    fn session_properties(
+        state: &str,
+        active: &str,
+        seat: &str,
+        remote: &str,
+        class: &str,
+        session_type: &str,
+    ) -> SessionProperties {
+        parse_session_properties(
+            format!(
+                "Seat={seat}\nRemote={remote}\nType={session_type}\nClass={class}\nActive={active}\nState={state}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn session_properties_require_exact_active_state() {
+        assert!(session_properties("active", "yes", "seat0", "no", "user", "x11").is_active());
+        for state in ["inactive", "closing", "online", "active-extra", ""] {
+            assert!(!session_properties(state, "yes", "seat0", "no", "user", "x11").is_active());
+        }
+        assert!(!session_properties("active", "no", "seat0", "no", "user", "wayland").is_active());
+        assert!(parse_session_properties(b"State=active\nState=inactive\n").is_none());
+        assert!(parse_session_properties(b"State=active\nUnknown=value\n").is_none());
+        assert!(parse_session_properties(b"\xff").is_none());
+    }
+
+    #[test]
+    fn active_session_selection_skips_inactive_and_rejects_ambiguity() {
+        let sessions = parse_listed_sessions(
+            b"old 1001 alice seat0 tty1 no -\ncurrent 1002 bob seat0 tty2 no -\n",
+        )
+        .unwrap();
+        let selected = select_active_session(&sessions, false, |sid| match sid {
+            "old" => Some(session_properties(
+                "inactive", "no", "seat0", "no", "user", "x11",
+            )),
+            "current" => Some(session_properties(
+                "active", "yes", "seat0", "no", "user", "wayland",
+            )),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(selected.id(), "current");
+        assert_eq!(
+            session_values(&[0, 1, 2], &selected.fields),
+            ["current", "1002", "bob"]
+        );
+
+        assert!(select_active_session(&sessions, false, |_sid| {
+            Some(session_properties(
+                "active", "yes", "seat0", "no", "user", "x11",
+            ))
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn session_selection_handles_greeter_and_seatless_fallback_strictly() {
+        let greeter = parse_listed_sessions(b"g1 120 gdm seat0 tty1 no -\n").unwrap();
+        let greeter_properties = |_sid: &str| {
+            Some(session_properties(
+                "active", "yes", "seat0", "no", "greeter", "wayland",
+            ))
+        };
+        assert!(select_active_session(&greeter, true, greeter_properties).is_none());
+        assert_eq!(
+            select_active_session(&greeter, false, greeter_properties)
+                .unwrap()
+                .id(),
+            "g1"
+        );
+
+        let seatless = parse_listed_sessions(b"c1 1000 alice - pts/1 no -\n").unwrap();
+        assert!(select_active_session(&seatless, false, |_sid| {
+            Some(session_properties("active", "yes", "", "no", "user", "x11"))
+        })
+        .is_some());
+        for (remote, session_type, class) in [
+            ("yes", "x11", "user"),
+            ("no", "tty", "user"),
+            ("no", "x11", "manager"),
+        ] {
+            assert!(select_active_session(&seatless, false, |_sid| {
+                Some(session_properties(
+                    "active",
+                    "yes",
+                    "",
+                    remote,
+                    class,
+                    session_type,
+                ))
+            })
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn session_list_parser_rejects_malformed_or_duplicate_identity() {
+        assert!(parse_listed_sessions(b"").unwrap().is_empty());
+        assert!(parse_listed_sessions(b"c1 not-a-uid alice seat0\n").is_none());
+        assert!(parse_listed_sessions(b"c1 1000 alice\n").is_none());
+        assert!(parse_listed_sessions(b"c1 1000 alice seat0\nc1 1001 bob seat0\n").is_none());
+        assert!(parse_listed_sessions(b"\xff").is_none());
     }
 
     /// Test get_home_dir_trusted: returns valid path and ignores HOME env var
