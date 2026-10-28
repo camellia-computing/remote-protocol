@@ -78,4 +78,63 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn modern_frame_wire_fixture_and_limits_remain_stable() {
+        // Standard single-segment frame, five content bytes, final raw block.
+        // A fixed frame proves decoding independently from the current encoder.
+        let encoded = b"\x28\xb5\x2f\xfd\x20\x05\x29\x00\x00hello";
+        assert_eq!(decompress_with_limit(encoded, 5).unwrap(), b"hello");
+        assert!(decompress_with_limit(encoded, 4).is_err());
+        for end in 1..encoded.len() {
+            assert!(decompress_with_limit(&encoded[..end], 5).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_frames_fail_without_returning_partial_output() {
+        // Remote has never emitted these pre-modern zstd formats. Legacy
+        // decoder support is deliberately not part of the product dependency.
+        for magic in [0x24, 0x25, 0x26, 0x27] {
+            let corrupt_legacy = [magic, 0xb5, 0x2f, 0xfd, 0, 0];
+            assert!(decompress_with_limit(&corrupt_legacy, 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn reused_bulk_compressor_isolates_each_job_on_each_thread() {
+        let workers: Vec<_> = (0..8)
+            .map(|thread| {
+                std::thread::spawn(move || {
+                    for job in 0..64 {
+                        let content =
+                            format!("isolated-compression-test-thread-{thread}-job-{job}")
+                                .repeat(job + 1);
+                        let compressed = compress(content.as_bytes()).unwrap();
+                        assert_eq!(
+                            decompress_with_limit(&compressed, content.len()).unwrap(),
+                            content.as_bytes()
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn patched_output_buffer_initializes_the_gap_before_publishing_length() {
+        // RUSTSEC-2026-0397: exercise the reviewed fixed safe-API contract. Do
+        // not run this memory read against the old unsound implementation.
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(b"kept");
+        {
+            let output = zstd::zstd_safe::OutBuffer::around_pos(&mut bytes, 12);
+            assert_eq!(output.pos(), 12);
+        }
+        assert_eq!(&bytes[..4], b"kept");
+        assert_eq!(&bytes[4..], &[0; 8]);
+    }
 }

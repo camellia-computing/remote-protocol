@@ -84,6 +84,38 @@ jobs:
       - name: Check Apple-specific code
         run: cargo check --locked --all-targets --all-features
 
+  windows-compression:
+    name: Windows native compression (${{ matrix.target }})
+    runs-on: windows-2022
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    env:
+      COMPRESSION_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add $env:COMPRESSION_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Compile native dependency and Windows consumers
+        shell: pwsh
+        run: cargo check --locked --all-targets --all-features --target $env:COMPRESSION_TARGET
+      - name: Exercise compression bounds without filesystem or desktop changes
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: cargo test --locked --target $env:COMPRESSION_TARGET compress::tests
+
   required:
     name: CI / Required
     if: always()
@@ -92,6 +124,7 @@ jobs:
       - automation
       - macos-quality
       - quality
+      - windows-compression
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -103,6 +136,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           MACOS_QUALITY_RESULT: ${{ needs.macos-quality.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
+          WINDOWS_COMPRESSION_RESULT: ${{ needs.windows-compression.result }}
         run: |
           [[ "$AUTOMATION_RESULT" == success ]] || {
             echo "Automation must succeed, got: $AUTOMATION_RESULT" >&2
@@ -114,6 +148,10 @@ jobs:
           }
           [[ "$MACOS_QUALITY_RESULT" == success ]] || {
             echo "macOS quality must succeed, got: $MACOS_QUALITY_RESULT" >&2
+            exit 1
+          }
+          [[ "$WINDOWS_COMPRESSION_RESULT" == success ]] || {
+            echo "Windows native compression must succeed, got: $WINDOWS_COMPRESSION_RESULT" >&2
             exit 1
           }
           if [[ "$EVENT_NAME" == pull_request ]]; then

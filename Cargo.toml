@@ -20,7 +20,8 @@ bytes = { version = "1.10", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
 socket2 = { version = "0.3", features = ["reuseport"] }
-zstd = "0.13"
+# Remote uses modern frames only: no legacy decoder or dictionary trainer.
+zstd = { version = "0.14.3", default-features = false }
 anyhow = "1.0"
 futures-util = "0.3"
 directories-next = "2.0"
